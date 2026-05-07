@@ -1,0 +1,14 @@
+[package]
+authors           = ["DarkSky <darksky2048@gmail.com>"]
+description       = "Precomp2 file transforms for assetpack, with optional zstd and lzma wrapping."
+edition.workspace = true
+keywords          = ["asset", "precomp", "compression", "zstd", "lzma"]
+license           = "AGPL-3.0-or-later"
+name              = "assetpack-transform-precomp2"
+version           = "0.1.0"
+
+[dependencies]
+assetpack-core = { workspace = true }
+lzma-rust2    = { workspace = true }
+precomp2      = { workspace = true }
+zstd          = { workspace = true }
