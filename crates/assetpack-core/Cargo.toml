@@ -5,6 +5,7 @@ edition.workspace = true
 keywords          = ["asset", "packing", "deduplication", "sqlite", "compression"]
 license           = "AGPL-3.0-or-later"
 name              = "assetpack-core"
+readme            = "../../README.md"
 repository        = "https://github.com/darkskygit/assetpack"
 version           = "0.1.0"
 
