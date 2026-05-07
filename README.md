@@ -7,6 +7,16 @@
 - `assetpack-core`: core hashing, chunking, codec, recipe, file-transform, pipeline, and SQLite pack primitives.
 - `assetpack-transform-precomp2`: optional file transforms built on `precomp2`, with zstd and lzma wrapping variants.
 
+## Features
+
+- SHA3-256 object identity and recipe integrity checks.
+- FastCDC content-defined chunking with stable default bounds.
+- Per-chunk raw, zstd, and Brotli storage with automatic fallback when compression is not worthwhile.
+- SQLite object storage for chunks and recipes, plus optional namespaced stores for embedding.
+- File transform selection with decode verification before accepting transformed output.
+- Merkle index rebuilds, integrity checks, membership proofs, and batched proof lookup.
+- Optional `precomp2`, `precomp2-zstd`, and `precomp2-lzma` transforms.
+
 ## Usage
 
 ```rust
