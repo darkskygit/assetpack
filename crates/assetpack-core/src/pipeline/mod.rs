@@ -2,8 +2,9 @@ use crate::{
   FastCdcSplitter,
   codec::{Codec, compress, compress_auto},
   error::Result,
-  file_transform::{FileHint, TRANSFORM_ID_NONE, TransformSelection, TransformSelector},
+  file_transform::{FileHint, TransformSelection, TransformSelector},
   hash::Hash32,
+  transform::TRANSFORM_ID_NONE,
 };
 
 #[derive(Debug, Clone, Copy)]

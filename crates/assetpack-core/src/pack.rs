@@ -18,13 +18,8 @@ use crate::{
   codec::{Codec, compress, decompress},
   error::{Error, Result},
   hash::Hash32,
+  object::{ObjectKind, ObjectRecord, ObjectSource, VerifiedObject},
 };
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ObjectKind {
-  Chunk = 1,
-  Recipe = 2,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PackJournalMode {
@@ -39,34 +34,6 @@ impl PackJournalMode {
       PackJournalMode::Wal => SqliteJournalMode::Wal,
     }
   }
-}
-
-impl ObjectKind {
-  pub(crate) fn from_i64(v: i64) -> Option<Self> {
-    match v {
-      1 => Some(ObjectKind::Chunk),
-      2 => Some(ObjectKind::Recipe),
-      _ => None,
-    }
-  }
-}
-
-#[derive(Debug, Clone)]
-pub struct StoredObject {
-  pub hash: Hash32,
-  pub kind: ObjectKind,
-  pub size: u64,
-  pub codec: Codec,
-  pub content: Vec<u8>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ObjectRecord {
-  pub hash: Hash32,
-  pub kind: ObjectKind,
-  pub size: u64,
-  pub codec: Codec,
-  pub content: Vec<u8>,
 }
 
 pub type PackWriteTx<'a> = Transaction<'a, Sqlite>;
@@ -167,10 +134,10 @@ impl Pack {
       builder.push_values(chunk, |mut b, obj| {
         b.push_bind(obj.hash.as_bytes().as_ref())
           .push_bind(obj.kind as i64)
-          .push_bind(obj.size as i64)
-          .push_bind(obj.content.len() as i64)
+          .push_bind(obj.decoded_len as i64)
+          .push_bind(obj.stored_bytes.len() as i64)
           .push_bind(codec_to_str(obj.codec))
-          .push_bind(obj.content.as_slice())
+          .push_bind(obj.stored_bytes.as_slice())
           .push_bind(now);
       });
       builder.build().execute(&mut **tx).await?;
@@ -247,7 +214,7 @@ impl Pack {
     Ok(())
   }
 
-  pub async fn get_object(&self, hash: &Hash32) -> Result<Option<StoredObject>> {
+  async fn read_verified_object(&self, hash: &Hash32) -> Result<Option<VerifiedObject>> {
     let row = sqlx::query(r#"SELECT kind, size, codec, content FROM objects WHERE hash = ?1"#)
       .bind(hash.as_bytes().as_ref())
       .fetch_optional(&self.pool)
@@ -263,18 +230,22 @@ impl Pack {
     let codec = codec_from_str(&codec_str)?;
     let stored: Vec<u8> = row.get("content");
     let decompressed = decompress(codec, &stored)?;
-    if decompressed.len() as i64 != size {
-      return Err(Error::Integrity("size mismatch".into()));
+    let expected = u64::try_from(size).map_err(|_| Error::Integrity("negative object size".into()))?;
+    let actual = decompressed.len() as u64;
+    if actual != expected {
+      return Err(Error::ObjectLengthMismatch { expected, actual });
     }
-    if Hash32::sha3_256(&decompressed) != *hash {
-      return Err(Error::HashMismatch);
+    let actual_hash = Hash32::sha3_256(&decompressed);
+    if actual_hash != *hash {
+      return Err(Error::ObjectHashMismatch {
+        expected: *hash,
+        actual: actual_hash,
+      });
     }
-    Ok(Some(StoredObject {
+    Ok(Some(VerifiedObject {
       hash: *hash,
       kind,
-      size: size as u64,
-      codec,
-      content: decompressed,
+      bytes: decompressed,
     }))
   }
 
@@ -363,7 +334,7 @@ impl Pack {
     Ok(Some(Hash32::from_bytes(&bytes)?))
   }
 
-  pub async fn all_objects(&self) -> Result<Vec<StoredObject>> {
+  pub async fn all_objects(&self) -> Result<Vec<VerifiedObject>> {
     let rows = sqlx::query("SELECT hash, kind, size, codec, content FROM objects ORDER BY hash ASC")
       .fetch_all(&self.pool)
       .await?;
@@ -376,18 +347,22 @@ impl Pack {
       let codec = codec_from_str(&row.get::<String, _>("codec"))?;
       let stored: Vec<u8> = row.get("content");
       let content = decompress(codec, &stored)?;
-      if content.len() as i64 != size {
-        return Err(Error::Integrity("size mismatch".into()));
+      let expected = u64::try_from(size).map_err(|_| Error::Integrity("negative object size".into()))?;
+      let actual = content.len() as u64;
+      if actual != expected {
+        return Err(Error::ObjectLengthMismatch { expected, actual });
       }
-      if Hash32::sha3_256(&content) != hash {
-        return Err(Error::HashMismatch);
+      let actual_hash = Hash32::sha3_256(&content);
+      if actual_hash != hash {
+        return Err(Error::ObjectHashMismatch {
+          expected: hash,
+          actual: actual_hash,
+        });
       }
-      objects.push(StoredObject {
+      objects.push(VerifiedObject {
         hash,
         kind,
-        size: size as u64,
-        codec,
-        content,
+        bytes: content,
       });
     }
     Ok(objects)
@@ -968,15 +943,22 @@ fn object_record_from_row(row: SqliteRow) -> Result<ObjectRecord> {
   let hash = Hash32::from_bytes(&hash_bytes).map_err(|_| Error::HashMismatch)?;
   let kind = ObjectKind::from_i64(row.get::<i64, _>("kind")).ok_or_else(|| Error::Integrity("invalid kind".into()))?;
   let size: i64 = row.get("size");
+  let decoded_len = u64::try_from(size).map_err(|_| Error::Integrity("negative object size".into()))?;
   let codec = codec_from_str(&row.get::<String, _>("codec"))?;
-  let content: Vec<u8> = row.get("content");
+  let stored_bytes: Vec<u8> = row.get("content");
   Ok(ObjectRecord {
     hash,
     kind,
-    size: size as u64,
+    decoded_len,
     codec,
-    content,
+    stored_bytes,
   })
+}
+
+impl ObjectSource for Pack {
+  async fn read_object(&self, hash: &Hash32) -> Result<Option<VerifiedObject>> {
+    self.read_verified_object(hash).await
+  }
 }
 
 fn local_vfs_name() -> &'static str {
@@ -1137,7 +1119,6 @@ mod tests {
   use std::{collections::HashMap, fs};
 
   use futures_util::TryStreamExt;
-  use rand::RngCore;
   use tempfile::tempdir;
 
   use super::*;
@@ -1148,15 +1129,38 @@ mod tests {
     let pack_path = dir.path().join("test.db");
     let pack = Pack::open(&pack_path).await.unwrap();
 
-    let mut data = vec![0u8; 4096];
-    rand::rng().fill_bytes(&mut data);
+    let data = (0..4096).map(|index| (index % 251) as u8).collect::<Vec<_>>();
     let hash = Hash32::sha3_256(&data);
 
     pack.put_chunk(hash, &data, Codec::Zstd).await.unwrap();
-    let loaded = pack.get_object(&hash).await.unwrap().unwrap();
+    let loaded = pack.read_object(&hash).await.unwrap().unwrap();
     assert_eq!(loaded.hash, hash);
     assert_eq!(loaded.kind, ObjectKind::Chunk);
-    assert_eq!(loaded.content, data);
+    assert_eq!(loaded.bytes, data);
+
+    sqlx::query("UPDATE objects SET size = size + 1 WHERE hash = ?1")
+      .bind(hash.as_bytes().as_ref())
+      .execute(&pack.pool)
+      .await
+      .unwrap();
+    assert!(matches!(
+      pack.read_object(&hash).await,
+      Err(Error::ObjectLengthMismatch { expected, actual }) if expected == data.len() as u64 + 1 && actual == data.len() as u64
+    ));
+    sqlx::query("UPDATE objects SET size = ?1, codec = 'raw', content = ?2 WHERE hash = ?3")
+      .bind(data.len() as i64)
+      .bind(vec![0_u8; data.len()])
+      .bind(hash.as_bytes().as_ref())
+      .execute(&pack.pool)
+      .await
+      .unwrap();
+    assert!(matches!(pack.read_object(&hash).await, Err(Error::ObjectHashMismatch { expected, .. }) if expected == hash));
+    sqlx::query("UPDATE objects SET kind = 99 WHERE hash = ?1")
+      .bind(hash.as_bytes().as_ref())
+      .execute(&pack.pool)
+      .await
+      .unwrap();
+    assert!(matches!(pack.read_object(&hash).await, Err(Error::Integrity(_))));
   }
 
   #[tokio::test]
@@ -1171,9 +1175,9 @@ mod tests {
     let hash = Hash32::sha3_256(&data);
     pack.put_chunk(hash, &data, Codec::Zstd).await.unwrap();
 
-    let stored = pack.get_object(&hash).await.unwrap().unwrap();
+    let stored = pack.stream_object_records().try_next().await.unwrap().unwrap();
     assert_eq!(stored.codec, Codec::Raw);
-    assert_eq!(stored.content, data);
+    assert_eq!(stored.stored_bytes, data);
   }
 
   #[tokio::test]
@@ -1270,9 +1274,9 @@ mod tests {
     pack.put_recipe(recipe_hash, &recipe, Codec::Raw).await.unwrap();
 
     let expected = pack.all_objects().await.unwrap();
-    let expected_map: HashMap<Hash32, (ObjectKind, u64, Codec)> = expected
+    let expected_map: HashMap<Hash32, (ObjectKind, u64)> = expected
       .into_iter()
-      .map(|obj| (obj.hash, (obj.kind, obj.size, obj.codec)))
+      .map(|obj| (obj.hash, (obj.kind, obj.bytes.len() as u64)))
       .collect();
 
     let streamed = pack.stream_object_records().try_collect::<Vec<_>>().await.unwrap();
@@ -1280,8 +1284,8 @@ mod tests {
     for record in streamed {
       let expected = expected_map.get(&record.hash).unwrap();
       assert_eq!(record.kind, expected.0);
-      assert_eq!(record.size, expected.1);
-      assert_eq!(record.codec, expected.2);
+      assert_eq!(record.decoded_len, expected.1);
+      assert_eq!(record.codec, Codec::Raw);
     }
 
     let streamed_batched = pack.stream_object_records_with_batch_size(2).try_collect::<Vec<_>>().await.unwrap();
@@ -1289,8 +1293,8 @@ mod tests {
     for record in streamed_batched {
       let expected = expected_map.get(&record.hash).unwrap();
       assert_eq!(record.kind, expected.0);
-      assert_eq!(record.size, expected.1);
-      assert_eq!(record.codec, expected.2);
+      assert_eq!(record.decoded_len, expected.1);
+      assert_eq!(record.codec, Codec::Raw);
     }
   }
 
@@ -1319,7 +1323,7 @@ mod tests {
     }
 
     let reopened = Pack::open_readonly(&pack_path).await.unwrap();
-    let loaded = reopened.get_object(&hash).await.unwrap().unwrap();
-    assert_eq!(loaded.content, data);
+    let loaded = reopened.read_object(&hash).await.unwrap().unwrap();
+    assert_eq!(loaded.bytes, data);
   }
 }

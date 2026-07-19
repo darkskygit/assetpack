@@ -1,11 +1,12 @@
 # assetpack
 
-`assetpack` provides Rust crates for content-addressed asset packing. It focuses on splitting files into stable chunks, deduplicating payloads by SHA3-256, writing SQLite-backed packs with content-addressed objects, and recording recipes that can rebuild the original bytes.
+`assetpack` provides Rust crates for content-addressed asset packing. It focuses on splitting files into stable chunks, deduplicating payloads by SHA3-256, writing SQLite-backed/Sealed packs with content-addressed objects, and recording recipes that can rebuild the original bytes.
 
 ## Crates
 
-- `assetpack-core`: core hashing, chunking, codec, recipe, file-transform, pipeline, and SQLite pack primitives.
+- `assetpack-core`: core hashing, chunking, codec, recipe, `FileReader`, pipeline, and SQLite/Sealed pack primitives.
 - `assetpack-transform-precomp2`: optional file transforms built on `precomp2`, with zstd and lzma wrapping variants.
+- Core features `serde`, `sqlite`, and `file-transform` are enabled by default; `sealed` and `sealed-encryption` are opt-in and independent of SQLite.
 
 ## Features
 
@@ -19,62 +20,87 @@
 
 ## Usage
 
-```rust
-use assetpack_core::{ChunkCompressionPolicy, FastCdcSplitter, FileHint, Hash32, Pipeline, PipelineConfig};
+### Choosing a store
 
-fn main() -> assetpack_core::Result<()> {
-  let data = b"asset payload".to_vec();
-  let hash = Hash32::sha3_256(&data);
-  let hint = FileHint {
-    size: data.len() as u64,
-    extension: Some("bin".into()),
-    head: Some(data[..data.len().min(16)].to_vec()),
-  };
-  let pipeline = Pipeline::new(PipelineConfig {
-    splitter: FastCdcSplitter::v1_defaults(),
-    chunk_compression: ChunkCompressionPolicy::Auto,
-    discard_payload: false,
-  });
+All stores expose the same read contract (`ObjectSource`), so restoration code is identical for every backend. They differ only in write lifecycle:
 
-  let plan = pipeline.run(data, &hint, hash, None)?;
-  assert_eq!(plan.original_hash, hash);
-  Ok(())
-}
+- `Pack`: a mutable SQLite store in a single file — incremental writes, transactions, Merkle proofs.
+- `SqliteStore`: the same store, embeddable in an existing SQLite database under a table namespace.
+- SealedPack: an immutable single-file snapshot for distribution or archival. It is built once from a complete object set, can be encrypted, and is never updated in place — changing content means building a new pack.
 
-```
+### Storing files
 
-To enable `precomp2` transforms during selection, pass the transform specs from `assetpack-transform-precomp2`.
+`Pipeline` splits an input into chunks, compresses each one, and computes everything needed to rebuild the file. Persist the plan into `Pack` or `SqliteStore` and keep the returned recipe hash — it is the handle for later restoration:
 
 ```rust
-use assetpack_core::{
-  ChunkCompressionPolicy, FastCdcSplitter, FileHint, FileTransformConfig, Hash32, Pipeline, PipelineConfig, TransformSelector,
-};
+use assetpack_core::{Codec, FileHint, Hash32, ObjectKind, ObjectRecord, Pack, Pipeline, PipelineConfig, build_recipe};
 
-fn main() -> assetpack_core::Result<()> {
-  let data = b"asset payload".repeat(8);
-  let hash = Hash32::sha3_256(&data);
-  let hint = FileHint {
-    size: data.len() as u64,
-    extension: Some("bin".into()),
-    head: Some(data[..data.len().min(16)].to_vec()),
-  };
-  let selector = TransformSelector::new(FileTransformConfig::default(), None, assetpack_transform_precomp2::default_specs());
-  let pipeline = Pipeline::new(PipelineConfig {
-    splitter: FastCdcSplitter::v1_defaults(),
-    chunk_compression: ChunkCompressionPolicy::Auto,
-    discard_payload: false,
-  });
+async fn store_file(pack: &Pack, data: Vec<u8>) -> assetpack_core::Result<Hash32> {
+  let original_hash = Hash32::sha3_256(&data);
+  let hint = FileHint { size: data.len() as u64, extension: None, head: None };
+  let plan = Pipeline::new(PipelineConfig::default()).run(data, &hint, original_hash, None)?;
 
-  let plan = pipeline.run(data, &hint, hash, Some(&selector))?;
-  assert_eq!(plan.original_hash, hash);
-  Ok(())
+  let recipe_chunks: Vec<_> = plan.chunks.iter().map(|chunk| (chunk.hash, chunk.raw_len)).collect();
+  let recipe = build_recipe(plan.original_size, &recipe_chunks, original_hash, plan.transform_id, plan.transform_version);
+  let recipe_hash = Hash32::sha3_256(&recipe);
+
+  let objects: Vec<_> = plan
+    .chunks
+    .into_iter()
+    .map(|chunk| ObjectRecord {
+      hash: chunk.hash,
+      kind: ObjectKind::Chunk,
+      decoded_len: u64::from(chunk.raw_len),
+      codec: chunk.codec,
+      stored_bytes: chunk.payload.expect("payload is kept unless discard_payload is set"),
+    })
+    .collect();
+  let mut tx = pack.begin_write_tx().await?;
+  Pack::put_objects_batch_tx(&mut tx, &objects).await?;
+  pack.put_recipe(recipe_hash, &recipe, Codec::Raw).await?;
+  tx.commit().await?;
+  Ok(recipe_hash)
 }
-
 ```
 
-## Status
+To also try `precomp2`-family transforms during selection, build a `TransformSelector` from `assetpack_transform_precomp2::default_specs()` and pass it as the last argument of `run`.
 
-These crates are early-stage and the public API and on-disk formats may change before a 1.0 release.
+### Building a SealedPack
+
+```rust
+use assetpack_core::{DEFAULT_FORMAT_TAG, Pack, SealedPackBuilder};
+use futures_util::TryStreamExt;
+
+async fn export(pack: &Pack, root_recipe: assetpack_core::Hash32) -> assetpack_core::Result<Vec<u8>> {
+  let objects: Vec<_> = pack.stream_object_records().try_collect().await?;
+  SealedPackBuilder::build_plain(DEFAULT_FORMAT_TAG, root_recipe, objects)
+}
+```
+
+### Restoring a file
+
+Construct a `TransformDecoderRegistry` with every transform version you have ever written, then use one `FileReader` for any store:
+
+```rust
+use assetpack_core::{FileReadLimits, FileReader, Hash32, ObjectSource, TransformDecoderRegistry};
+
+async fn restore<S: ObjectSource + ?Sized>(source: &S, root: Hash32) -> assetpack_core::Result<Vec<u8>> {
+  let decoders = TransformDecoderRegistry::default();
+  FileReader::new(source, &decoders, FileReadLimits::default()).read_file(root).await
+}
+```
+
+Decoders are selected by the exact `(transform_id, transform_version)` recorded in the recipe; unknown pairs fail with `UnsupportedTransform` instead of falling back silently. For precomp2 support, register `assetpack_transform_precomp2::default_decoders(&config)`. Restoration returns the complete file; seek or range decoding of transformed files is not supported.
+
+## What a successful call proves
+
+- `ObjectSource::read_object`: the returned bytes match the requested object hash.
+- `SealedPackReader::verify_all_objects()`: every object in the container passes that same check.
+- `FileReader::read_file` / `restore_file`: the restored bytes equal the original file, in size and SHA3-256.
+
+## Compatibility
+
+These crates are pre-1.0 and the public API may still change. The SealedPack v1 on-disk format is pinned by a byte-exact golden fixture; any format change requires a new revision. Parsers and the shared read path are fuzzed continuously in CI: curated seeds live in `fuzz/corpus`, dynamic corpus stays in CI caches, and every crash becomes a deterministic regression test.
 
 ## License
 

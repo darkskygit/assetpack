@@ -9,8 +9,9 @@ mod tests;
 
 use std::sync::Arc;
 
-use assetpack_core::file_transform::{
-  FileTransform, FileTransformConfig, TRANSFORM_ID_PRECOMP2, TRANSFORM_ID_PRECOMP2_LZMA, TRANSFORM_ID_PRECOMP2_ZSTD, TransformSpec,
+use assetpack_core::{
+  TRANSFORM_ID_PRECOMP2, TRANSFORM_ID_PRECOMP2_LZMA, TRANSFORM_ID_PRECOMP2_ZSTD, TransformDecoder,
+  file_transform::{FileTransform, FileTransformConfig, TransformSpec},
 };
 pub use precomp2::Precomp2Transform;
 pub use precomp2_lzma::Precomp2LzmaTransform;
@@ -66,5 +67,13 @@ pub fn default_specs() -> Vec<TransformSpec> {
       enabled: precomp2_lzma_enabled,
       build: build_precomp2_lzma,
     },
+  ]
+}
+
+pub fn default_decoders(config: &FileTransformConfig) -> Vec<Arc<dyn TransformDecoder>> {
+  vec![
+    Arc::new(Precomp2Transform::new(config)),
+    Arc::new(Precomp2ZstdTransform::new(config)),
+    Arc::new(Precomp2LzmaTransform::new(config)),
   ]
 }

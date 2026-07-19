@@ -1,0 +1,8 @@
+/artifacts/
+/coverage/
+# Only the small, named startup seeds under fuzz/corpus/<target>/ are tracked
+# (force-added; each seed name states the path it covers). Dynamic corpus
+# growth from local or CI fuzzing stays untracked: CI restores it from the
+# scheduled corpus cache, minimizes it weekly, and never commits it.
+/corpus/
+/target/

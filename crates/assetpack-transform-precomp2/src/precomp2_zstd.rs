@@ -1,7 +1,8 @@
 use std::io::{BufRead, Write};
 
-use assetpack_core::file_transform::{
-  FileHint, FileTransform, FileTransformConfig, TRANSFORM_ID_PRECOMP2_ZSTD, TRANSFORM_VERSION_PRECOMP2_ZSTD, TransformStats,
+use assetpack_core::{
+  TRANSFORM_ID_PRECOMP2_ZSTD, TRANSFORM_VERSION_PRECOMP2_ZSTD, TransformDecoder,
+  file_transform::{FileHint, FileTransform, FileTransformConfig, TransformStats},
 };
 
 use crate::common::{
@@ -28,7 +29,7 @@ impl Precomp2ZstdTransform {
   }
 }
 
-impl FileTransform for Precomp2ZstdTransform {
+impl TransformDecoder for Precomp2ZstdTransform {
   fn id(&self) -> u16 {
     TRANSFORM_ID_PRECOMP2_ZSTD
   }
@@ -37,6 +38,16 @@ impl FileTransform for Precomp2ZstdTransform {
     TRANSFORM_VERSION_PRECOMP2_ZSTD
   }
 
+  fn decode(&self, input: &mut dyn BufRead, out: &mut dyn Write) -> assetpack_core::Result<()> {
+    let encoded = read_all(input)?;
+    let decoded = zstd_decompress(&encoded)?;
+    let output = precomp2_decode_bytes(&decoded, &self.decode_config)?;
+    out.write_all(&output)?;
+    Ok(())
+  }
+}
+
+impl FileTransform for Precomp2ZstdTransform {
   fn quick_check(&self, hint: &FileHint) -> bool {
     self.gate.quick_check(hint)
   }
@@ -51,13 +62,5 @@ impl FileTransform for Precomp2ZstdTransform {
       input_bytes: input_len,
       output_bytes: compressed.len() as u64,
     })
-  }
-
-  fn decode(&self, input: &mut dyn BufRead, out: &mut dyn Write) -> assetpack_core::Result<()> {
-    let encoded = read_all(input)?;
-    let decoded = zstd_decompress(&encoded)?;
-    let output = precomp2_decode_bytes(&decoded, &self.decode_config)?;
-    out.write_all(&output)?;
-    Ok(())
   }
 }

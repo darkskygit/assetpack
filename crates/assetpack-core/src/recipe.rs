@@ -63,6 +63,30 @@ pub fn parse_recipe_checked(bytes: &[u8], expected_hash: &Hash32) -> Result<Reci
   parse_recipe(bytes)
 }
 
+pub(crate) fn preflight_recipe_limits(bytes: &[u8]) -> Result<(u64, u32)> {
+  let version = *bytes.first().ok_or_else(|| Error::Other("empty recipe".into()))?;
+  let original_file_size = u64::from_le_bytes(
+    bytes
+      .get(1..9)
+      .ok_or_else(|| Error::Other("recipe too short".into()))?
+      .try_into()
+      .expect("the slice length is fixed"),
+  );
+  let chunk_count_offset = match version {
+    RECIPE_VERSION_V1 | RECIPE_VERSION_V2 => 9,
+    RECIPE_VERSION_V3 => 45,
+    _ => return Err(Error::Other(format!("unexpected recipe version {version}"))),
+  };
+  let chunk_count = u32::from_le_bytes(
+    bytes
+      .get(chunk_count_offset..chunk_count_offset + 4)
+      .ok_or_else(|| Error::Other("recipe too short".into()))?
+      .try_into()
+      .expect("the slice length is fixed"),
+  );
+  Ok((original_file_size, chunk_count))
+}
+
 fn parse_recipe_v1(bytes: &[u8], mut offset: usize, version: u8) -> Result<RecipeData> {
   if bytes.len() < offset + 8 + 4 + 32 {
     return Err(Error::Other("recipe too short".into()));

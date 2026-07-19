@@ -15,7 +15,8 @@ use crate::{
   codec::{Codec, compress, decompress},
   error::{Error, Result},
   hash::Hash32,
-  pack::{MerkleProof, MerkleSummary, ObjectKind, ObjectRecord, StoredObject, merkle_root_from_hashes},
+  object::{ObjectKind, ObjectRecord, ObjectSource, VerifiedObject},
+  pack::{MerkleProof, MerkleSummary, merkle_root_from_hashes},
 };
 
 const SQLITE_PARAM_LIMIT: usize = 999;
@@ -183,10 +184,10 @@ impl SqliteStore {
       builder.push_values(chunk, |mut b, obj| {
         b.push_bind(obj.hash.as_bytes().as_ref())
           .push_bind(obj.kind as i64)
-          .push_bind(obj.size as i64)
-          .push_bind(obj.content.len() as i64)
+          .push_bind(obj.decoded_len as i64)
+          .push_bind(obj.stored_bytes.len() as i64)
           .push_bind(codec_to_str(obj.codec))
-          .push_bind(obj.content.as_slice())
+          .push_bind(obj.stored_bytes.as_slice())
           .push_bind(now);
       });
       builder.build().execute(&mut **tx).await?;
@@ -262,7 +263,7 @@ impl SqliteStore {
     Ok(())
   }
 
-  pub async fn get_object(&self, hash: &Hash32) -> Result<Option<StoredObject>> {
+  async fn read_verified_object(&self, hash: &Hash32) -> Result<Option<VerifiedObject>> {
     let query = format!("SELECT kind, size, codec, content FROM {} WHERE hash = ?1", self.tables.objects);
     let row = sqlx::query(&query)
       .bind(hash.as_bytes().as_ref())
@@ -271,7 +272,7 @@ impl SqliteStore {
     let Some(row) = row else {
       return Ok(None);
     };
-    Ok(Some(stored_object_from_row(row, *hash)?))
+    Ok(Some(verified_object_from_row(row, *hash)?))
   }
 
   pub async fn existing_hashes(&self, hashes: &[Hash32]) -> Result<HashSet<Hash32>> {
@@ -334,7 +335,7 @@ impl SqliteStore {
     Ok(Some(Hash32::from_bytes(&bytes)?))
   }
 
-  pub async fn all_objects(&self) -> Result<Vec<StoredObject>> {
+  pub async fn all_objects(&self) -> Result<Vec<VerifiedObject>> {
     let query = format!(
       "SELECT hash, kind, size, codec, content FROM {} ORDER BY hash ASC",
       self.tables.objects
@@ -344,7 +345,7 @@ impl SqliteStore {
     for row in rows {
       let hash_bytes: Vec<u8> = row.get("hash");
       let hash = Hash32::from_bytes(&hash_bytes)?;
-      objects.push(stored_object_from_row(row, hash)?);
+      objects.push(verified_object_from_row(row, hash)?);
     }
     Ok(objects)
   }
@@ -601,25 +602,35 @@ fn schema_statements(tables: &TableNames, merkle: MerkleMode) -> Vec<String> {
   statements
 }
 
-fn stored_object_from_row(row: SqliteRow, hash: Hash32) -> Result<StoredObject> {
+fn verified_object_from_row(row: SqliteRow, hash: Hash32) -> Result<VerifiedObject> {
   let kind = ObjectKind::from_i64(row.get::<i64, _>("kind")).ok_or_else(|| Error::Integrity("invalid kind".into()))?;
   let size: i64 = row.get("size");
   let codec = codec_from_str(&row.get::<String, _>("codec"))?;
   let stored: Vec<u8> = row.get("content");
   let content = decompress(codec, &stored)?;
-  if content.len() as i64 != size {
-    return Err(Error::Integrity("size mismatch".into()));
+  let expected = u64::try_from(size).map_err(|_| Error::Integrity("negative object size".into()))?;
+  let actual = content.len() as u64;
+  if actual != expected {
+    return Err(Error::ObjectLengthMismatch { expected, actual });
   }
-  if Hash32::sha3_256(&content) != hash {
-    return Err(Error::HashMismatch);
+  let actual_hash = Hash32::sha3_256(&content);
+  if actual_hash != hash {
+    return Err(Error::ObjectHashMismatch {
+      expected: hash,
+      actual: actual_hash,
+    });
   }
-  Ok(StoredObject {
+  Ok(VerifiedObject {
     hash,
     kind,
-    size: size as u64,
-    codec,
-    content,
+    bytes: content,
   })
+}
+
+impl ObjectSource for SqliteStore {
+  async fn read_object(&self, hash: &Hash32) -> Result<Option<VerifiedObject>> {
+    self.read_verified_object(hash).await
+  }
 }
 
 async fn read_meta_value(pool: &SqlitePool, table: &str, key: &str) -> Result<Option<String>> {
@@ -716,10 +727,31 @@ mod tests {
     let data = b"hello embedded store".to_vec();
     let hash = Hash32::sha3_256(&data);
     store.put_chunk(hash, &data, Codec::Zstd).await.unwrap();
-    let loaded = store.get_object(&hash).await.unwrap().unwrap();
+    let loaded = store.read_object(&hash).await.unwrap().unwrap();
     assert_eq!(loaded.hash, hash);
     assert_eq!(loaded.kind, ObjectKind::Chunk);
-    assert_eq!(loaded.content, data);
+    assert_eq!(loaded.bytes, data);
+
+    sqlx::query("UPDATE ipg_objects SET size = size + 1 WHERE hash = ?1")
+      .bind(hash.as_bytes().as_ref())
+      .execute(&pool)
+      .await
+      .unwrap();
+    assert!(matches!(store.read_object(&hash).await, Err(Error::ObjectLengthMismatch { .. })));
+    sqlx::query("UPDATE ipg_objects SET size = ?1, codec = 'raw', content = ?2 WHERE hash = ?3")
+      .bind(data.len() as i64)
+      .bind(vec![0_u8; data.len()])
+      .bind(hash.as_bytes().as_ref())
+      .execute(&pool)
+      .await
+      .unwrap();
+    assert!(matches!(store.read_object(&hash).await, Err(Error::ObjectHashMismatch { expected, .. }) if expected == hash));
+    sqlx::query("UPDATE ipg_objects SET kind = 99 WHERE hash = ?1")
+      .bind(hash.as_bytes().as_ref())
+      .execute(&pool)
+      .await
+      .unwrap();
+    assert!(matches!(store.read_object(&hash).await, Err(Error::Integrity(_))));
   }
 
   #[tokio::test]
@@ -736,9 +768,9 @@ mod tests {
     let object = ObjectRecord {
       hash,
       kind: ObjectKind::Chunk,
-      size: data.len() as u64,
+      decoded_len: data.len() as u64,
       codec: Codec::Raw,
-      content: data.clone(),
+      stored_bytes: data.clone(),
     };
 
     let mut tx = pool.begin().await.unwrap();

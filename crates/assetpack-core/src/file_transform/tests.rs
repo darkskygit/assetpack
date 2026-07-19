@@ -9,7 +9,7 @@ use crate::hash::Hash32;
 #[derive(Debug, Clone)]
 struct DummyTransform;
 
-impl FileTransform for DummyTransform {
+impl crate::TransformDecoder for DummyTransform {
   fn id(&self) -> u16 {
     0xFFFF
   }
@@ -18,6 +18,13 @@ impl FileTransform for DummyTransform {
     1
   }
 
+  fn decode(&self, input: &mut dyn BufRead, out: &mut dyn Write) -> crate::Result<()> {
+    std::io::copy(input, out)?;
+    Ok(())
+  }
+}
+
+impl FileTransform for DummyTransform {
   fn quick_check(&self, _hint: &FileHint) -> bool {
     true
   }
@@ -28,11 +35,6 @@ impl FileTransform for DummyTransform {
       input_bytes: bytes,
       output_bytes: bytes,
     })
-  }
-
-  fn decode(&self, input: &mut dyn BufRead, out: &mut dyn Write) -> crate::Result<()> {
-    std::io::copy(input, out)?;
-    Ok(())
   }
 }
 
@@ -60,13 +62,6 @@ fn spool_overflow_falls_back() {
   let mut spool = StoredStreamSpool::new_memory(4);
   assert!(spool.write_all(&[1, 2, 3]).is_ok());
   assert!(spool.write_all(&[4, 5]).is_err());
-}
-
-#[test]
-fn registry_always_includes_none_transform() {
-  let config = FileTransformConfig::default();
-  let registry = TransformRegistry::new(&config, vec![]);
-  assert!(registry.get(TRANSFORM_ID_NONE).is_some());
 }
 
 #[test]

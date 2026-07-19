@@ -6,16 +6,10 @@ mod transforms;
 #[cfg(test)]
 mod tests;
 
-use crate::hash::Hash32;
-
-pub const TRANSFORM_ID_NONE: u16 = 0;
-pub const TRANSFORM_ID_PRECOMP2: u16 = 1;
-pub const TRANSFORM_ID_PRECOMP2_ZSTD: u16 = 2;
-pub const TRANSFORM_ID_PRECOMP2_LZMA: u16 = 3;
-pub const TRANSFORM_VERSION_NONE: u16 = 0;
-pub const TRANSFORM_VERSION_PRECOMP2: u16 = 1;
-pub const TRANSFORM_VERSION_PRECOMP2_ZSTD: u16 = 1;
-pub const TRANSFORM_VERSION_PRECOMP2_LZMA: u16 = 1;
+use crate::{
+  hash::Hash32,
+  transform::{TRANSFORM_ID_NONE, TRANSFORM_VERSION_NONE, TransformDecoder},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransformInfo {
@@ -36,12 +30,9 @@ pub struct TransformStats {
   pub output_bytes: u64,
 }
 
-pub trait FileTransform: Send + Sync {
-  fn id(&self) -> u16;
-  fn version(&self) -> u16;
+pub trait FileTransform: TransformDecoder {
   fn quick_check(&self, hint: &FileHint) -> bool;
   fn encode(&self, input: &mut dyn std::io::BufRead, out: &mut dyn std::io::Write) -> crate::Result<TransformStats>;
-  fn decode(&self, input: &mut dyn std::io::BufRead, out: &mut dyn std::io::Write) -> crate::Result<()>;
 }
 
 #[derive(Clone)]
@@ -101,4 +92,4 @@ pub use config::{
 };
 pub use selector::TransformSelector;
 pub use spool::{StoredStreamReader, StoredStreamSpool};
-pub use transforms::{TransformRegistry, TransformSpec};
+pub use transforms::TransformSpec;
