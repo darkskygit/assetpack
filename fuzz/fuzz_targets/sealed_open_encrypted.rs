@@ -5,8 +5,9 @@ mod support;
 use std::sync::OnceLock;
 
 use assetpack_core::{
-  build_recipe, Codec, FileReadLimits, FileReader, Hash32, ObjectKind, ObjectRecord, PackOpenPolicy, ParsedSealedPack, SealedPackBuilder,
-  SealedPackTag, SoftwareFrameKey, TransformDecoderRegistry, HEADER_BYTES, TRANSFORM_ID_NONE, TRANSFORM_VERSION_NONE,
+  build_recipe, sealed::HEADER_BYTES, Codec, FileReadLimits, FileReader, Hash32, ObjectKind, ObjectRecord, PackOpenPolicy,
+  ParsedSealedPack, SealedPackBuilder, SealedPackTag, SoftwareFrameKey, TransformDecoderRegistry, TRANSFORM_ID_NONE,
+  TRANSFORM_VERSION_NONE,
 };
 use libfuzzer_sys::fuzz_target;
 
