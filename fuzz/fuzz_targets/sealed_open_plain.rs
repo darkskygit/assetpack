@@ -27,6 +27,6 @@ fuzz_target!(|input: &[u8]| {
       max_stored_stream_bytes: 1024 * 1024,
       max_original_file_bytes: 1024 * 1024,
     });
-    let _ = support::block_on(file_reader.read_file(reader.root_recipe()));
+    let _ = file_reader.read_file(reader.root_recipe());
   }
 });

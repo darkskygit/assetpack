@@ -4,9 +4,9 @@ use std::{
 };
 
 use assetpack_core::{
-  DEFAULT_FORMAT_TAG, FileHint, FileReadLimits, FileReader, FileTransformConfig, FileTransformPrecomp2Config, Hash32, ObjectKind,
-  ObjectRecord, ObjectSource, Pack, PackOpenPolicy, ParsedSealedPack, SealedPackBuilder, SealedPackTag, SoftwareFrameKey, SqliteStore,
-  TRANSFORM_ID_NONE, TRANSFORM_ID_PRECOMP2, TRANSFORM_ID_PRECOMP2_LZMA, TRANSFORM_ID_PRECOMP2_ZSTD, TransformDecoderRegistry,
+  AsyncFileReader, DEFAULT_FORMAT_TAG, FileHint, FileReadLimits, FileReader, FileTransformConfig, FileTransformPrecomp2Config, Hash32,
+  ObjectKind, ObjectRecord, ObjectSource, PackOpenPolicy, ParsedSealedPack, SealedPackBuilder, SealedPackTag, SoftwareFrameKey, SqlitePack,
+  SqlxStore, TRANSFORM_ID_NONE, TRANSFORM_ID_PRECOMP2, TRANSFORM_ID_PRECOMP2_LZMA, TRANSFORM_ID_PRECOMP2_ZSTD, TransformDecoderRegistry,
   TransformSelector, VerifiedObject, build_recipe, file_transform::FileTransform,
 };
 
@@ -96,15 +96,14 @@ fn decoder_registry_contains_every_persisted_precomp2_pair() {
 struct MemorySource(BTreeMap<Hash32, VerifiedObject>);
 
 impl ObjectSource for MemorySource {
-  async fn read_object(&self, hash: &Hash32) -> assetpack_core::Result<Option<VerifiedObject>> {
+  fn read_object(&self, hash: &Hash32) -> assetpack_core::Result<Option<VerifiedObject>> {
     Ok(self.0.get(hash).cloned())
   }
 }
 
-async fn read_file<S: ObjectSource + ?Sized>(source: &S, registry: &TransformDecoderRegistry, recipe_hash: Hash32) -> Vec<u8> {
+fn read_file<S: ObjectSource + ?Sized>(source: &S, registry: &TransformDecoderRegistry, recipe_hash: Hash32) -> Vec<u8> {
   FileReader::new(source, registry, FileReadLimits::default())
     .read_file(recipe_hash)
-    .await
     .unwrap()
 }
 
@@ -162,7 +161,7 @@ async fn file_reader_restores_all_fixed_transform_recipes() {
       ),
     ]));
     let reader = FileReader::new(&source, &registry, FileReadLimits::default());
-    assert_eq!(reader.read_file(recipe_hash).await.unwrap(), TINY_PNG, "transform {id}:{version}");
+    assert_eq!(reader.read_file(recipe_hash).unwrap(), TINY_PNG, "transform {id}:{version}");
 
     let objects = source
       .0
@@ -176,11 +175,9 @@ async fn file_reader_restores_all_fixed_transform_recipes() {
       })
       .collect::<Vec<_>>();
     let directory = tempfile::tempdir().unwrap();
-    let pack = Pack::open(directory.path().join("pack.db")).await.unwrap();
-    let mut tx = pack.begin_write_tx().await.unwrap();
-    Pack::put_objects_batch_tx(&mut tx, &objects).await.unwrap();
-    tx.commit().await.unwrap();
-    let store = SqliteStore::open(directory.path().join("store.db")).await.unwrap();
+    let pack = SqlitePack::open(directory.path().join("pack.db")).unwrap();
+    pack.put_objects_batch(&objects).unwrap();
+    let store = SqlxStore::open(directory.path().join("store.db")).await.unwrap();
     let mut tx = store.begin_write_tx().await.unwrap();
     store.put_objects_batch_tx(&mut tx, &objects).await.unwrap();
     tx.commit().await.unwrap();
@@ -195,10 +192,13 @@ async fn file_reader_restores_all_fixed_transform_recipes() {
     let parsed = ParsedSealedPack::open(&encrypted_bytes, tag, PackOpenPolicy::EncryptedRequired).unwrap();
     let encrypted = parsed.unlock(&key).unwrap();
     for restored in [
-      read_file(&pack, &registry, recipe_hash).await,
-      read_file(&store, &registry, recipe_hash).await,
-      read_file(&plain, &registry, recipe_hash).await,
-      read_file(&encrypted, &registry, recipe_hash).await,
+      read_file(&pack, &registry, recipe_hash),
+      AsyncFileReader::new(&store, &registry, FileReadLimits::default())
+        .read_file(recipe_hash)
+        .await
+        .unwrap(),
+      read_file(&plain, &registry, recipe_hash),
+      read_file(&encrypted, &registry, recipe_hash),
     ] {
       assert_eq!(restored, TINY_PNG, "transform {id}:{version}");
     }

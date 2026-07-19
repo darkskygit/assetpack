@@ -106,7 +106,7 @@ impl<'a> SealedPackReader<'a> {
 }
 
 impl ObjectSource for SealedPackReader<'_> {
-  async fn read_object(&self, hash: &Hash32) -> Result<Option<VerifiedObject>> {
+  fn read_object(&self, hash: &Hash32) -> Result<Option<VerifiedObject>> {
     let Some(record) = self
       .records
       .binary_search_by_key(hash, |record| record.hash)

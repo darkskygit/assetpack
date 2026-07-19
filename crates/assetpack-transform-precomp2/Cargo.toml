@@ -7,7 +7,7 @@ license           = "AGPL-3.0-or-later"
 name              = "assetpack-transform-precomp2"
 readme            = "../../README.md"
 repository        = "https://github.com/darkskygit/assetpack"
-version           = "0.2.0"
+version           = "0.3.0"
 
 [dependencies]
 assetpack-core = { workspace = true, features = ["file-transform"] }
@@ -16,6 +16,6 @@ precomp2       = { workspace = true }
 zstd           = { workspace = true }
 
 [dev-dependencies]
-assetpack-core = { workspace = true, features = ["sealed-encryption"] }
+assetpack-core = { workspace = true, features = ["sealed-encryption", "sqlx-store"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }

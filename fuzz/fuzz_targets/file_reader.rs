@@ -15,7 +15,7 @@ use libfuzzer_sys::fuzz_target;
 struct MemorySource(BTreeMap<Hash32, VerifiedObject>);
 
 impl ObjectSource for MemorySource {
-  async fn read_object(&self, hash: &Hash32) -> assetpack_core::Result<Option<VerifiedObject>> {
+  fn read_object(&self, hash: &Hash32) -> assetpack_core::Result<Option<VerifiedObject>> {
     Ok(self.0.get(hash).cloned())
   }
 }
@@ -116,8 +116,8 @@ fuzz_target!(|input: &[u8]| {
     max_stored_stream_bytes: 8192,
     max_original_file_bytes: 8192,
   };
-  let memory_outcome = outcome(support::block_on(FileReader::new(&memory, &registry, limits).read_file(recipe_hash)));
-  let sealed_outcome = outcome(support::block_on(FileReader::new(&sealed, &registry, limits).read_file(recipe_hash)));
+  let memory_outcome = outcome(FileReader::new(&memory, &registry, limits).read_file(recipe_hash));
+  let sealed_outcome = outcome(FileReader::new(&sealed, &registry, limits).read_file(recipe_hash));
   assert_eq!(memory_outcome, sealed_outcome);
   if transform.0 == TRANSFORM_ID_NONE && control & 2 == 0 {
     assert_eq!(memory_outcome, Outcome::Bytes(original));

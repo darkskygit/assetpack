@@ -1,3 +1,5 @@
+use std::future::Future;
+
 use crate::{Result, codec::Codec, hash::Hash32};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -7,12 +9,12 @@ pub enum ObjectKind {
 }
 
 impl ObjectKind {
-  #[cfg(feature = "sqlite")]
+  #[cfg(any(feature = "sqlite-pack", feature = "rusqlite-store", feature = "sqlx-store"))]
   pub(crate) fn from_i64(value: i64) -> Option<Self> {
     Self::from_u8(value.try_into().ok()?)
   }
 
-  #[cfg(any(feature = "sealed", feature = "sqlite"))]
+  #[cfg(any(feature = "sealed", feature = "sqlite-pack", feature = "rusqlite-store", feature = "sqlx-store"))]
   pub(crate) fn from_u8(value: u8) -> Option<Self> {
     match value {
       1 => Some(Self::Chunk),
@@ -38,7 +40,10 @@ pub struct ObjectRecord {
   pub stored_bytes: Vec<u8>,
 }
 
-#[allow(async_fn_in_trait)]
-pub trait ObjectSource: Send + Sync {
-  async fn read_object(&self, hash: &Hash32) -> Result<Option<VerifiedObject>>;
+pub trait ObjectSource {
+  fn read_object(&self, hash: &Hash32) -> Result<Option<VerifiedObject>>;
+}
+
+pub trait AsyncObjectSource: Send + Sync {
+  fn read_object<'a>(&'a self, hash: &'a Hash32) -> impl Future<Output = Result<Option<VerifiedObject>>> + Send + 'a;
 }

@@ -1,7 +1,4 @@
-use chacha20poly1305::{
-  ChaCha20Poly1305, KeyInit,
-  aead::{AeadInPlace, generic_array::GenericArray},
-};
+use chacha20poly1305::{AeadInOut, ChaCha20Poly1305, Key, KeyInit, Nonce, Tag};
 use hkdf::Hkdf;
 use sha2::Sha256;
 use zeroize::{Zeroize, Zeroizing};
@@ -115,9 +112,11 @@ impl FrameSealer for SoftwareFrameKey {
   fn seal_record(&self, context: &SealedRecordContext, in_out: &mut [u8]) -> Result<[u8; 16]> {
     let result = (|| {
       let material = self.material(context)?;
-      let cipher = ChaCha20Poly1305::new(GenericArray::from_slice(&material[..32]));
+      let key = Key::try_from(&material[..32]).expect("derived key has fixed length");
+      let nonce = Nonce::try_from(&material[32..44]).expect("derived nonce has fixed length");
+      let cipher = ChaCha20Poly1305::new(&key);
       let tag = cipher
-        .encrypt_in_place_detached(GenericArray::from_slice(&material[32..44]), context.aad(), in_out)
+        .encrypt_inout_detached(&nonce, context.aad(), in_out.into())
         .map_err(|_| Error::AuthenticationFailed)?;
       Ok(tag.into())
     })();
@@ -136,14 +135,12 @@ impl FrameUnsealer for SoftwareFrameKey {
   fn unseal_record(&self, context: &SealedRecordContext, in_out: &mut [u8], tag: &[u8; 16]) -> Result<()> {
     let result = (|| {
       let material = self.material(context)?;
-      let cipher = ChaCha20Poly1305::new(GenericArray::from_slice(&material[..32]));
+      let key = Key::try_from(&material[..32]).expect("derived key has fixed length");
+      let nonce = Nonce::try_from(&material[32..44]).expect("derived nonce has fixed length");
+      let tag = Tag::from(*tag);
+      let cipher = ChaCha20Poly1305::new(&key);
       cipher
-        .decrypt_in_place_detached(
-          GenericArray::from_slice(&material[32..44]),
-          context.aad(),
-          in_out,
-          GenericArray::from_slice(tag),
-        )
+        .decrypt_inout_detached(&nonce, context.aad(), in_out.into(), &tag)
         .map_err(|_| Error::AuthenticationFailed)
     })();
     if result.is_err() {
@@ -170,9 +167,11 @@ mod tests {
       "d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d63dbea45e8ca9671282fafb69da92728b1a71de0a9e060b2905d6a5b67ecd3b3692ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d7bc3ff4def08e4b7a9de576d26586cec64b6116",
     )
     .unwrap();
-    let cipher = ChaCha20Poly1305::new(GenericArray::from_slice(&key));
+    let key = Key::try_from(key.as_slice()).unwrap();
+    let nonce = Nonce::try_from(nonce.as_slice()).unwrap();
+    let cipher = ChaCha20Poly1305::new(&key);
     let tag = cipher
-      .encrypt_in_place_detached(GenericArray::from_slice(&nonce), &aad, &mut plaintext)
+      .encrypt_inout_detached(&nonce, &aad, plaintext.as_mut_slice().into())
       .unwrap();
     assert_eq!(plaintext, expected);
     assert_eq!(tag.as_slice(), &hex::decode("1ae10b594f09e26a7e902ecbd0600691").unwrap());

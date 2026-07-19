@@ -6,7 +6,7 @@ use std::{
 use sha3::{Digest, Sha3_256};
 
 use crate::{
-  Error, Hash32, ObjectKind, ObjectSource, RecipeData, Result, TransformDecoderRegistry, parse_recipe, recipe::preflight_recipe_limits,
+  AsyncObjectSource, Error, Hash32, ObjectKind, RecipeData, Result, TransformDecoderRegistry, parse_recipe, recipe::preflight_recipe_limits,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,7 +32,62 @@ pub struct FileReader<'a, S: ?Sized> {
   limits: FileReadLimits,
 }
 
-impl<'a, S: ObjectSource + ?Sized> FileReader<'a, S> {
+impl<'a, S: crate::ObjectSource + ?Sized> FileReader<'a, S> {
+  pub fn new(source: &'a S, decoders: &'a TransformDecoderRegistry, limits: FileReadLimits) -> Self {
+    Self { source, decoders, limits }
+  }
+
+  pub fn resolve_closure(&self, recipe_hash: Hash32) -> Result<BTreeSet<Hash32>> {
+    let recipe = self.load_recipe(recipe_hash)?;
+    let mut hashes = BTreeSet::from([recipe_hash]);
+    for (hash, expected_len) in &recipe.chunks {
+      let object = self.source.read_object(hash)?.ok_or(Error::ObjectNotFound)?;
+      validate_chunk(&object.hash, object.kind, object.bytes.len() as u64, u64::from(*expected_len))?;
+      hashes.insert(*hash);
+    }
+    Ok(hashes)
+  }
+
+  pub fn read_stored_stream(&self, recipe_hash: Hash32) -> Result<Vec<u8>> {
+    let recipe = self.load_recipe(recipe_hash)?;
+    self.read_stored_for_recipe(&recipe)
+  }
+
+  pub fn restore_file(&self, recipe_hash: Hash32, output: &mut dyn Write) -> Result<()> {
+    let recipe = self.load_recipe(recipe_hash)?;
+    let stored = self.read_stored_for_recipe(&recipe)?;
+    decode_recipe(self.decoders, &recipe, stored, output)
+  }
+
+  pub fn read_file(&self, recipe_hash: Hash32) -> Result<Vec<u8>> {
+    let recipe = self.load_recipe(recipe_hash)?;
+    let stored = self.read_stored_for_recipe(&recipe)?;
+    read_decoded_file(self.decoders, &recipe, stored)
+  }
+
+  fn load_recipe(&self, recipe_hash: Hash32) -> Result<RecipeData> {
+    let object = self.source.read_object(&recipe_hash)?.ok_or(Error::ObjectNotFound)?;
+    load_recipe_from_object(object, recipe_hash, self.limits)
+  }
+
+  fn read_stored_for_recipe(&self, recipe: &RecipeData) -> Result<Vec<u8>> {
+    let mut stored = Vec::new();
+    for (hash, expected_len) in &recipe.chunks {
+      let object = self.source.read_object(hash)?.ok_or(Error::ObjectNotFound)?;
+      validate_chunk(&object.hash, object.kind, object.bytes.len() as u64, u64::from(*expected_len))?;
+      append_chunk(&mut stored, &object.bytes, recipe.stored_stream_size)?;
+    }
+    Ok(stored)
+  }
+}
+
+pub struct AsyncFileReader<'a, S: ?Sized> {
+  source: &'a S,
+  decoders: &'a TransformDecoderRegistry,
+  limits: FileReadLimits,
+}
+
+impl<'a, S: AsyncObjectSource + ?Sized> AsyncFileReader<'a, S> {
   pub fn new(source: &'a S, decoders: &'a TransformDecoderRegistry, limits: FileReadLimits) -> Self {
     Self { source, decoders, limits }
   }
@@ -42,7 +97,7 @@ impl<'a, S: ObjectSource + ?Sized> FileReader<'a, S> {
     let mut hashes = BTreeSet::from([recipe_hash]);
     for (hash, expected_len) in &recipe.chunks {
       let object = self.source.read_object(hash).await?.ok_or(Error::ObjectNotFound)?;
-      self.validate_chunk(&object.hash, object.kind, object.bytes.len() as u64, u64::from(*expected_len))?;
+      validate_chunk(&object.hash, object.kind, object.bytes.len() as u64, u64::from(*expected_len))?;
       hashes.insert(*hash);
     }
     Ok(hashes)
@@ -56,127 +111,130 @@ impl<'a, S: ObjectSource + ?Sized> FileReader<'a, S> {
   pub async fn restore_file(&self, recipe_hash: Hash32, output: &mut dyn Write) -> Result<()> {
     let recipe = self.load_recipe(recipe_hash).await?;
     let stored = self.read_stored_for_recipe(&recipe).await?;
-    self.decode_recipe(&recipe, stored, output)
+    decode_recipe(self.decoders, &recipe, stored, output)
   }
 
   pub async fn read_file(&self, recipe_hash: Hash32) -> Result<Vec<u8>> {
     let recipe = self.load_recipe(recipe_hash).await?;
     let stored = self.read_stored_for_recipe(&recipe).await?;
-    let mut output = FallibleVecWriter::default();
-    let result = self.decode_recipe(&recipe, stored, &mut output);
-    if let Some(requested) = output.allocation_failure {
-      return Err(Error::FileReadAllocationFailed {
-        buffer: "original file",
-        requested,
-      });
-    }
-    result?;
-    Ok(output.bytes)
+    read_decoded_file(self.decoders, &recipe, stored)
   }
 
   async fn load_recipe(&self, recipe_hash: Hash32) -> Result<RecipeData> {
     let object = self.source.read_object(&recipe_hash).await?.ok_or(Error::ObjectNotFound)?;
-    if object.kind != ObjectKind::Recipe {
-      return Err(Error::ObjectKindMismatch {
-        hash: recipe_hash,
-        expected: ObjectKind::Recipe,
-        actual: object.kind,
-      });
-    }
-    let (original_file_size, chunk_count) =
-      preflight_recipe_limits(&object.bytes).map_err(|error| Error::InvalidRecipe(error.to_string()))?;
-    self.check_limit("chunk count", self.limits.max_chunk_count, u64::from(chunk_count))?;
-    self.check_limit("original file bytes", self.limits.max_original_file_bytes, original_file_size)?;
-    let recipe = parse_recipe(&object.bytes).map_err(|error| Error::InvalidRecipe(error.to_string()))?;
-    self.check_limit(
-      "stored stream bytes",
-      self.limits.max_stored_stream_bytes,
-      recipe.stored_stream_size,
-    )?;
-    Ok(recipe)
+    load_recipe_from_object(object, recipe_hash, self.limits)
   }
 
   async fn read_stored_for_recipe(&self, recipe: &RecipeData) -> Result<Vec<u8>> {
     let mut stored = Vec::new();
     for (hash, expected_len) in &recipe.chunks {
       let object = self.source.read_object(hash).await?.ok_or(Error::ObjectNotFound)?;
-      self.validate_chunk(&object.hash, object.kind, object.bytes.len() as u64, u64::from(*expected_len))?;
-      let requested = stored
-        .len()
-        .checked_add(object.bytes.len())
-        .and_then(|length| u64::try_from(length).ok())
-        .ok_or(Error::FileReadAllocationFailed {
-          buffer: "stored stream",
-          requested: recipe.stored_stream_size,
-        })?;
-      stored
-        .try_reserve(object.bytes.len())
-        .map_err(|_| Error::FileReadAllocationFailed {
-          buffer: "stored stream",
-          requested,
-        })?;
-      stored.extend_from_slice(&object.bytes);
+      validate_chunk(&object.hash, object.kind, object.bytes.len() as u64, u64::from(*expected_len))?;
+      append_chunk(&mut stored, &object.bytes, recipe.stored_stream_size)?;
     }
     Ok(stored)
   }
+}
 
-  fn decode_recipe(&self, recipe: &RecipeData, stored: Vec<u8>, output: &mut dyn Write) -> Result<()> {
-    let decoder = self.decoders.get(recipe.transform_id, recipe.transform_version)?;
-    let mut input = BufReader::new(Cursor::new(stored));
-    let mut verified = VerifyingWriter::new(output, recipe.original_file_size);
-    let result = decoder.decode(&mut input, &mut verified);
-    if verified.exceeded {
-      return self.original_mismatch(recipe, &verified);
-    }
-    result?;
-    let actual_hash = verified.hash();
-    if verified.written != recipe.original_file_size || actual_hash != recipe.original_file_hash {
-      return Err(Error::OriginalFileMismatch {
-        expected_size: recipe.original_file_size,
-        actual_size: verified.written,
-        expected_hash: recipe.original_file_hash,
-        actual_hash,
-      });
-    }
-    Ok(())
+fn load_recipe_from_object(object: crate::VerifiedObject, recipe_hash: Hash32, limits: FileReadLimits) -> Result<RecipeData> {
+  if object.kind != ObjectKind::Recipe {
+    return Err(Error::ObjectKindMismatch {
+      hash: recipe_hash,
+      expected: ObjectKind::Recipe,
+      actual: object.kind,
+    });
   }
+  let (original_file_size, chunk_count) =
+    preflight_recipe_limits(&object.bytes).map_err(|error| Error::InvalidRecipe(error.to_string()))?;
+  check_limit("chunk count", limits.max_chunk_count, u64::from(chunk_count))?;
+  check_limit("original file bytes", limits.max_original_file_bytes, original_file_size)?;
+  let recipe = parse_recipe(&object.bytes).map_err(|error| Error::InvalidRecipe(error.to_string()))?;
+  check_limit("stored stream bytes", limits.max_stored_stream_bytes, recipe.stored_stream_size)?;
+  Ok(recipe)
+}
 
-  fn original_mismatch(&self, recipe: &RecipeData, writer: &VerifyingWriter<'_>) -> Result<()> {
-    Err(Error::OriginalFileMismatch {
+fn append_chunk(stored: &mut Vec<u8>, bytes: &[u8], expected_total: u64) -> Result<()> {
+  let requested = stored
+    .len()
+    .checked_add(bytes.len())
+    .and_then(|length| u64::try_from(length).ok())
+    .ok_or(Error::FileReadAllocationFailed {
+      buffer: "stored stream",
+      requested: expected_total,
+    })?;
+  stored.try_reserve(bytes.len()).map_err(|_| Error::FileReadAllocationFailed {
+    buffer: "stored stream",
+    requested,
+  })?;
+  stored.extend_from_slice(bytes);
+  Ok(())
+}
+
+fn validate_chunk(hash: &Hash32, kind: ObjectKind, actual_len: u64, expected_len: u64) -> Result<()> {
+  if kind != ObjectKind::Chunk {
+    return Err(Error::ObjectKindMismatch {
+      hash: *hash,
+      expected: ObjectKind::Chunk,
+      actual: kind,
+    });
+  }
+  if actual_len != expected_len {
+    return Err(Error::RecipeChunkLengthMismatch {
+      hash: *hash,
+      expected: expected_len,
+      actual: actual_len,
+    });
+  }
+  Ok(())
+}
+
+fn check_limit(limit: &'static str, maximum: u64, actual: u64) -> Result<()> {
+  if actual > maximum {
+    return Err(Error::FileReadLimitExceeded { limit, maximum, actual });
+  }
+  Ok(())
+}
+
+fn read_decoded_file(decoders: &TransformDecoderRegistry, recipe: &RecipeData, stored: Vec<u8>) -> Result<Vec<u8>> {
+  let mut output = FallibleVecWriter::default();
+  let result = decode_recipe(decoders, recipe, stored, &mut output);
+  if let Some(requested) = output.allocation_failure {
+    return Err(Error::FileReadAllocationFailed {
+      buffer: "original file",
+      requested,
+    });
+  }
+  result?;
+  Ok(output.bytes)
+}
+
+fn decode_recipe(decoders: &TransformDecoderRegistry, recipe: &RecipeData, stored: Vec<u8>, output: &mut dyn Write) -> Result<()> {
+  let decoder = decoders.get(recipe.transform_id, recipe.transform_version)?;
+  let mut input = BufReader::new(Cursor::new(stored));
+  let mut verified = VerifyingWriter::new(output, recipe.original_file_size);
+  let result = decoder.decode(&mut input, &mut verified);
+  if verified.exceeded {
+    return Err(original_mismatch(recipe, &verified));
+  }
+  result?;
+  let actual_hash = verified.hash();
+  if verified.written != recipe.original_file_size || actual_hash != recipe.original_file_hash {
+    return Err(Error::OriginalFileMismatch {
       expected_size: recipe.original_file_size,
-      actual_size: writer.written,
+      actual_size: verified.written,
       expected_hash: recipe.original_file_hash,
-      actual_hash: writer.hash(),
-    })
+      actual_hash,
+    });
   }
+  Ok(())
+}
 
-  fn validate_chunk(&self, hash: &Hash32, kind: ObjectKind, actual_len: u64, expected_len: u64) -> Result<()> {
-    if kind != ObjectKind::Chunk {
-      return Err(Error::ObjectKindMismatch {
-        hash: *hash,
-        expected: ObjectKind::Chunk,
-        actual: kind,
-      });
-    }
-    if actual_len != expected_len {
-      return Err(Error::RecipeChunkLengthMismatch {
-        hash: *hash,
-        expected: expected_len,
-        actual: actual_len,
-      });
-    }
-    Ok(())
-  }
-
-  fn check_limit(&self, limit: &'static str, maximum: u64, actual: u64) -> Result<()> {
-    if actual > maximum {
-      return Err(self.limit_error(limit, maximum, actual));
-    }
-    Ok(())
-  }
-
-  fn limit_error(&self, limit: &'static str, maximum: u64, actual: u64) -> Error {
-    Error::FileReadLimitExceeded { limit, maximum, actual }
+fn original_mismatch(recipe: &RecipeData, writer: &VerifyingWriter<'_>) -> Error {
+  Error::OriginalFileMismatch {
+    expected_size: recipe.original_file_size,
+    actual_size: writer.written,
+    expected_hash: recipe.original_file_hash,
+    actual_hash: writer.hash(),
   }
 }
 
@@ -271,7 +329,7 @@ mod tests {
   #[derive(Default)]
   struct MemorySource(BTreeMap<Hash32, VerifiedObject>);
 
-  impl ObjectSource for MemorySource {
+  impl AsyncObjectSource for MemorySource {
     async fn read_object(&self, hash: &Hash32) -> Result<Option<VerifiedObject>> {
       Ok(self.0.get(hash).cloned())
     }
@@ -334,7 +392,7 @@ mod tests {
         (TRANSFORM_ID_NONE, TRANSFORM_VERSION_NONE),
       );
       let registry = TransformDecoderRegistry::default();
-      let reader = FileReader::new(&source, &registry, FileReadLimits::default());
+      let reader = AsyncFileReader::new(&source, &registry, FileReadLimits::default());
       assert_eq!(reader.read_stored_stream(recipe_hash).await.unwrap(), expected);
       assert_eq!(reader.read_file(recipe_hash).await.unwrap(), expected);
       let mut restored = Vec::new();
@@ -411,7 +469,7 @@ mod tests {
       );
       let chunk_hash = parse_recipe(&source.0[&recipe_hash].bytes).unwrap().chunks[0].0;
       mutate(&mut source, recipe_hash, chunk_hash);
-      let reader = FileReader::new(&source, &registry, FileReadLimits::default());
+      let reader = AsyncFileReader::new(&source, &registry, FileReadLimits::default());
       for result in [
         reader.read_file(recipe_hash).await.map(|_| ()),
         reader.resolve_closure(recipe_hash).await.map(|_| ()),
@@ -456,13 +514,13 @@ mod tests {
       max_original_file_bytes: bytes.len() as u64,
     };
     let (source, recipe_hash) = source_for(&[bytes], &[0], bytes.len() as u64, original_hash, (88, 1));
-    let reader = FileReader::new(&source, &registry, exact_limits);
+    let reader = AsyncFileReader::new(&source, &registry, exact_limits);
     assert_eq!(reader.read_file(recipe_hash).await.unwrap(), bytes);
     assert_eq!(calls.load(Ordering::Relaxed), 1);
 
     let declared_size = 8 * 1024 * 1024 * 1024;
     let (source, recipe_hash) = source_for(&[], &[], declared_size, Hash32::sha3_256([]), (0, 0));
-    let reader = FileReader::new(&source, &registry, FileReadLimits::default());
+    let reader = AsyncFileReader::new(&source, &registry, FileReadLimits::default());
     assert!(matches!(
       reader.read_file(recipe_hash).await,
       Err(Error::FileReadLimitExceeded {
@@ -471,7 +529,7 @@ mod tests {
         ..
       }) if actual == declared_size
     ));
-    let reader = FileReader::new(
+    let reader = AsyncFileReader::new(
       &source,
       &registry,
       FileReadLimits {
@@ -514,7 +572,7 @@ mod tests {
     for (limits, expected_limit) in cases {
       let before = calls.load(Ordering::Relaxed);
       let (source, recipe_hash) = source_for(&[bytes], &[0], bytes.len() as u64, original_hash, (88, 1));
-      let reader = FileReader::new(&source, &registry, limits);
+      let reader = AsyncFileReader::new(&source, &registry, limits);
       assert!(matches!(
         reader.read_file(recipe_hash).await,
         Err(Error::FileReadLimitExceeded { limit, .. }) if limit == expected_limit
@@ -524,7 +582,7 @@ mod tests {
 
     let (mut source, recipe_hash) = source_for(&[bytes], &[0], bytes.len() as u64, original_hash, (0, 0));
     source.0.get_mut(&recipe_hash).unwrap().bytes[45..49].copy_from_slice(&u32::MAX.to_le_bytes());
-    let reader = FileReader::new(
+    let reader = AsyncFileReader::new(
       &source,
       &registry,
       FileReadLimits {
@@ -539,7 +597,7 @@ mod tests {
     assert_eq!(calls.load(Ordering::Relaxed), 1);
 
     let (source, recipe_hash) = source_for(&[bytes], &[0], bytes.len() as u64, original_hash, (TRANSFORM_ID_NONE, 4));
-    let reader = FileReader::new(&source, &registry, FileReadLimits::default());
+    let reader = AsyncFileReader::new(&source, &registry, FileReadLimits::default());
     assert!(matches!(
       reader.read_file(recipe_hash).await,
       Err(Error::UnsupportedTransform {
@@ -550,7 +608,7 @@ mod tests {
 
     let (source, recipe_hash) = source_for(&[bytes], &[0], bytes.len() as u64, Hash32::sha3_256(b"other"), (0, 0));
     let none_registry = TransformDecoderRegistry::default();
-    let reader = FileReader::new(&source, &none_registry, FileReadLimits::default());
+    let reader = AsyncFileReader::new(&source, &none_registry, FileReadLimits::default());
     assert_eq!(reader.read_stored_stream(recipe_hash).await.unwrap(), bytes);
     assert!(matches!(
       reader.read_file(recipe_hash).await,
@@ -563,7 +621,7 @@ mod tests {
     ));
 
     let (source, recipe_hash) = source_for(&[bytes], &[0], bytes.len() as u64 + 1, original_hash, (0, 0));
-    let reader = FileReader::new(&source, &none_registry, FileReadLimits::default());
+    let reader = AsyncFileReader::new(&source, &none_registry, FileReadLimits::default());
     assert!(matches!(
       reader.read_file(recipe_hash).await,
       Err(Error::OriginalFileMismatch { expected_size, actual_size, .. }) if expected_size == bytes.len() as u64 + 1 && actual_size == bytes.len() as u64

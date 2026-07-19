@@ -93,7 +93,7 @@ fn two_chunk_fixture(size: usize) -> Fixture {
   }
 }
 
-#[cfg(all(feature = "sqlite", feature = "sealed-encryption"))]
+#[cfg(all(feature = "sqlite-pack", feature = "sealed-encryption"))]
 struct SharedObjectGraphFixture {
   root: Hash32,
   contract_objects: Vec<ObjectRecord>,
@@ -105,7 +105,7 @@ struct SharedObjectGraphFixture {
   wrong_kind: Hash32,
 }
 
-#[cfg(all(feature = "sqlite", feature = "sealed-encryption"))]
+#[cfg(all(feature = "sqlite-pack", feature = "sealed-encryption"))]
 fn shared_object_graph_fixture() -> SharedObjectGraphFixture {
   let chunks = [
     (
@@ -220,38 +220,32 @@ fn shared_object_graph_fixture() -> SharedObjectGraphFixture {
   }
 }
 
-#[cfg(all(feature = "sqlite", feature = "sealed-encryption"))]
-async fn assert_object_source_contract<S: crate::ObjectSource + ?Sized>(source: &S, fixture: &SharedObjectGraphFixture) {
+#[cfg(all(feature = "sqlite-pack", feature = "sealed-encryption"))]
+fn assert_object_source_contract<S: crate::ObjectSource + ?Sized>(source: &S, fixture: &SharedObjectGraphFixture) {
   for (expected_hash, expected_kind, expected_bytes) in &fixture.expected_objects {
-    let actual = source.read_object(expected_hash).await.unwrap().unwrap();
+    let actual = source.read_object(expected_hash).unwrap().unwrap();
     assert_eq!(actual.hash, *expected_hash);
     assert_eq!(actual.kind, *expected_kind);
     assert_eq!(actual.bytes, *expected_bytes);
   }
-  assert!(
-    source
-      .read_object(&Hash32::sha3_256(b"missing-object-fixture"))
-      .await
-      .unwrap()
-      .is_none()
-  );
+  assert!(source.read_object(&Hash32::sha3_256(b"missing-object-fixture")).unwrap().is_none());
   assert!(matches!(
-    source.read_object(&fixture.corrupt_codec).await,
+    source.read_object(&fixture.corrupt_codec),
     Err(crate::Error::Decompress(_))
   ));
   assert!(matches!(
-    source.read_object(&fixture.wrong_length).await,
+    source.read_object(&fixture.wrong_length),
     Err(crate::Error::ObjectLengthMismatch { .. })
   ));
   assert!(matches!(
-    source.read_object(&fixture.wrong_hash).await,
+    source.read_object(&fixture.wrong_hash),
     Err(crate::Error::ObjectHashMismatch { .. })
   ));
-  let wrong_kind = source.read_object(&fixture.wrong_kind).await.unwrap().unwrap();
+  let wrong_kind = source.read_object(&fixture.wrong_kind).unwrap().unwrap();
   assert_eq!(wrong_kind.kind, ObjectKind::Chunk);
 }
 
-#[cfg(all(feature = "sqlite", feature = "sealed-encryption"))]
+#[cfg(all(feature = "sqlite-pack", feature = "sealed-encryption"))]
 fn backend_file_fixture(codec: Codec, shape: usize) -> (Hash32, Vec<ObjectRecord>, Vec<u8>) {
   let label = match codec {
     Codec::Raw => "raw",
@@ -309,12 +303,11 @@ fn backend_file_fixture(codec: Codec, shape: usize) -> (Hash32, Vec<ObjectRecord
   (root, objects, expected)
 }
 
-#[cfg(all(feature = "sqlite", feature = "sealed-encryption"))]
-async fn restore_from<S: crate::ObjectSource + ?Sized>(source: &S, root: Hash32) -> Vec<u8> {
+#[cfg(all(feature = "sqlite-pack", feature = "sealed-encryption"))]
+fn restore_from<S: crate::ObjectSource + ?Sized>(source: &S, root: Hash32) -> Vec<u8> {
   let registry = crate::TransformDecoderRegistry::default();
   crate::FileReader::new(source, &registry, crate::FileReadLimits::default())
     .read_file(root)
-    .await
     .unwrap()
 }
 
@@ -382,22 +375,17 @@ fn plain_v1_golden_rebuilds_from_fixed_input() {
   assert_eq!(rebuilt, GOLDEN);
 }
 
-#[cfg(all(feature = "sqlite", feature = "sealed-encryption"))]
-#[tokio::test]
-async fn shared_object_graph_is_identical_across_mutable_and_sealed_backends() {
+#[cfg(all(feature = "sqlite-pack", feature = "sealed-encryption"))]
+#[test]
+fn shared_object_graph_is_identical_across_mutable_and_sealed_backends() {
   let fixture = shared_object_graph_fixture();
   let directory = tempfile::tempdir().unwrap();
-  let pack = crate::Pack::open(directory.path().join("pack.db")).await.unwrap();
-  let mut pack_tx = pack.begin_write_tx().await.unwrap();
-  crate::Pack::put_objects_batch_tx(&mut pack_tx, &fixture.contract_objects)
-    .await
-    .unwrap();
-  pack_tx.commit().await.unwrap();
+  let pack = crate::SqlitePack::open(directory.path().join("pack.db")).unwrap();
+  pack.put_objects_batch(&fixture.contract_objects).unwrap();
 
-  let store = crate::SqliteStore::open(directory.path().join("store.db")).await.unwrap();
-  let mut store_tx = store.begin_write_tx().await.unwrap();
-  store.put_objects_batch_tx(&mut store_tx, &fixture.contract_objects).await.unwrap();
-  store_tx.commit().await.unwrap();
+  let connection = rusqlite::Connection::open(directory.path().join("store.db")).unwrap();
+  let store = crate::RusqliteStore::from_connection(&connection).unwrap();
+  store.put_objects_batch(&fixture.contract_objects).unwrap();
 
   let plain_bytes = build_plain_bytes(DEFAULT_FORMAT_TAG, fixture.root, fixture.contract_objects.clone()).unwrap();
   let plain = open_plain(&plain_bytes, DEFAULT_FORMAT_TAG);
@@ -405,27 +393,23 @@ async fn shared_object_graph_is_identical_across_mutable_and_sealed_backends() {
   let encrypted_bytes = build_encrypted_bytes(PRODUCT_TAG, fixture.root, fixture.contract_objects.clone(), &key).unwrap();
   let parsed = ParsedSealedPack::open(&encrypted_bytes, PRODUCT_TAG, PackOpenPolicy::EncryptedRequired).unwrap();
   let encrypted = parsed.unlock(&key).unwrap();
-  assert_object_source_contract(&pack, &fixture).await;
-  assert_object_source_contract(&store, &fixture).await;
-  assert_object_source_contract(&plain, &fixture).await;
-  assert_object_source_contract(&encrypted, &fixture).await;
+  assert_object_source_contract(&pack, &fixture);
+  assert_object_source_contract(&store, &fixture);
+  assert_object_source_contract(&plain, &fixture);
+  assert_object_source_contract(&encrypted, &fixture);
 
   let registry = crate::TransformDecoderRegistry::default();
   let pack_file = crate::FileReader::new(&pack, &registry, crate::FileReadLimits::default())
     .read_file(fixture.root)
-    .await
     .unwrap();
   let store_file = crate::FileReader::new(&store, &registry, crate::FileReadLimits::default())
     .read_file(fixture.root)
-    .await
     .unwrap();
   let plain_file = crate::FileReader::new(&plain, &registry, crate::FileReadLimits::default())
     .read_file(fixture.root)
-    .await
     .unwrap();
   let encrypted_file = crate::FileReader::new(&encrypted, &registry, crate::FileReadLimits::default())
     .read_file(fixture.root)
-    .await
     .unwrap();
   for file in [pack_file, store_file, plain_file, encrypted_file] {
     assert_eq!(file, fixture.file);
@@ -437,18 +421,11 @@ async fn shared_object_graph_is_identical_across_mutable_and_sealed_backends() {
     .enumerate()
   {
     let (root, objects, expected) = backend_file_fixture(codec, shape);
-    let pack = crate::Pack::open(directory.path().join(format!("matrix-pack-{case}.db")))
-      .await
-      .unwrap();
-    let mut tx = pack.begin_write_tx().await.unwrap();
-    crate::Pack::put_objects_batch_tx(&mut tx, &objects).await.unwrap();
-    tx.commit().await.unwrap();
-    let store = crate::SqliteStore::open(directory.path().join(format!("matrix-store-{case}.db")))
-      .await
-      .unwrap();
-    let mut tx = store.begin_write_tx().await.unwrap();
-    store.put_objects_batch_tx(&mut tx, &objects).await.unwrap();
-    tx.commit().await.unwrap();
+    let pack = crate::SqlitePack::open(directory.path().join(format!("matrix-pack-{case}.db"))).unwrap();
+    pack.put_objects_batch(&objects).unwrap();
+    let connection = rusqlite::Connection::open(directory.path().join(format!("matrix-store-{case}.db"))).unwrap();
+    let store = crate::RusqliteStore::from_connection(&connection).unwrap();
+    store.put_objects_batch(&objects).unwrap();
     let plain_bytes = SealedPackBuilder::build_plain(DEFAULT_FORMAT_TAG, root, objects.clone()).unwrap();
     let plain = open_plain(&plain_bytes, DEFAULT_FORMAT_TAG);
     let key = software_key(61, 12);
@@ -456,10 +433,10 @@ async fn shared_object_graph_is_identical_across_mutable_and_sealed_backends() {
     let parsed = ParsedSealedPack::open(&encrypted_bytes, PRODUCT_TAG, PackOpenPolicy::EncryptedRequired).unwrap();
     let encrypted = parsed.unlock(&key).unwrap();
     for actual in [
-      restore_from(&pack, root).await,
-      restore_from(&store, root).await,
-      restore_from(&plain, root).await,
-      restore_from(&encrypted, root).await,
+      restore_from(&pack, root),
+      restore_from(&store, root),
+      restore_from(&plain, root),
+      restore_from(&encrypted, root),
     ] {
       assert_eq!(actual, expected, "codec {codec:?}, shape {shape}");
     }
@@ -479,7 +456,6 @@ async fn plain_build_is_deterministic_and_restores_with_file_reader() {
   let registry = crate::TransformDecoderRegistry::default();
   let file = crate::FileReader::new(&reader, &registry, crate::FileReadLimits::default())
     .read_file(fixture.root)
-    .await
     .unwrap();
   assert_eq!(file, fixture.file);
 }
@@ -705,7 +681,6 @@ async fn encrypted_builds_are_random_but_keep_logical_identity() {
   let registry = crate::TransformDecoderRegistry::default();
   let decoded = crate::FileReader::new(&first_reader, &registry, crate::FileReadLimits::default())
     .read_file(fixture.root)
-    .await
     .unwrap();
   assert_eq!(decoded, fixture.file);
 }
@@ -807,10 +782,7 @@ async fn encrypted_open_rejects_default_tag_slot_key_and_frame_corruption() {
   corrupted[payload_offset] ^= 1;
   let parsed = ParsedSealedPack::open(&corrupted, PRODUCT_TAG, PackOpenPolicy::EncryptedRequired).unwrap();
   let reader = parsed.unlock(&key).unwrap();
-  assert!(matches!(
-    reader.read_object(&chunk_hash).await,
-    Err(crate::Error::AuthenticationFailed)
-  ));
+  assert!(matches!(reader.read_object(&chunk_hash), Err(crate::Error::AuthenticationFailed)));
 }
 
 #[cfg(feature = "sealed-encryption")]

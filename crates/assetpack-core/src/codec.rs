@@ -111,7 +111,7 @@ pub fn compress_auto(data: &[u8], extension: Option<&str>) -> Result<(Codec, Vec
 
 #[cfg(test)]
 mod tests {
-  use rand::RngCore;
+  use rand::Rng;
 
   use super::*;
 

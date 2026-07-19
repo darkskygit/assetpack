@@ -4,9 +4,12 @@ use thiserror::Error;
 pub enum Error {
   #[error(transparent)]
   Io(#[from] std::io::Error),
-  #[cfg(feature = "sqlite")]
+  #[cfg(feature = "sqlx-store")]
   #[error(transparent)]
   Sql(#[from] sqlx::Error),
+  #[cfg(any(feature = "sqlite-pack", feature = "rusqlite-store"))]
+  #[error(transparent)]
+  Rusqlite(#[from] rusqlite::Error),
   #[error("invalid hash length: {0}, expected 32 bytes")]
   InvalidHashLength(usize),
   #[error("invalid hex encoding: {0}")]

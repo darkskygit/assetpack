@@ -98,7 +98,7 @@ impl TryFrom<String> for Hash32 {
 
 #[cfg(test)]
 mod tests {
-  use rand::RngCore;
+  use rand::Rng;
 
   use super::*;
 

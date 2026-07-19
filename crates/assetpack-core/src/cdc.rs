@@ -36,7 +36,7 @@ impl FastCdcSplitter {
   }
 
   pub fn split_bytes(&self, data: &[u8]) -> Vec<Chunk> {
-    FastCDC::new(data, self.min_size as u32, self.avg_size as u32, self.max_size as u32)
+    FastCDC::new(data, self.min_size, self.avg_size, self.max_size)
       .map(|c| Chunk {
         offset: c.offset,
         length: c.length,
@@ -47,7 +47,7 @@ impl FastCdcSplitter {
 
 #[cfg(test)]
 mod tests {
-  use rand::RngCore;
+  use rand::Rng;
 
   use super::*;
 

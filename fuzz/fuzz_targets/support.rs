@@ -1,23 +1,3 @@
-use std::{future::Future, sync::Arc, task::{Context, Poll, Wake, Waker}};
-
-struct NoopWake;
-
-impl Wake for NoopWake {
-  fn wake(self: Arc<Self>) {}
-}
-
-pub fn block_on<F: Future>(future: F) -> F::Output {
-  let waker = Waker::from(Arc::new(NoopWake));
-  let mut context = Context::from_waker(&waker);
-  let mut future = std::pin::pin!(future);
-  loop {
-    match future.as_mut().poll(&mut context) {
-      Poll::Ready(output) => return output,
-      Poll::Pending => std::thread::yield_now(),
-    }
-  }
-}
-
 #[allow(dead_code)]
 pub fn mutate_fixture(fixture: &mut Vec<u8>, mutations: &[u8]) {
   for mutation in mutations.chunks_exact(3) {
