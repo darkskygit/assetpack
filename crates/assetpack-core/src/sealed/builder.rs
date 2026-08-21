@@ -8,7 +8,7 @@ use super::{
   MAX_STORED_OBJECT_BYTES, SealedPackTag, index, invalid, logical_pack_id_records, stored_index_digest,
 };
 #[cfg(feature = "sealed-encryption")]
-use super::{FrameSealer, SealedRecordContext, seal_payload};
+use super::{FrameSealer, SealedRecordContext, checked_slice, seal_payload};
 use crate::{
   codec::decompress,
   error::{Error, Result},
@@ -44,28 +44,57 @@ pub(super) fn build_encrypted_bytes(
   objects: Vec<ObjectRecord>,
   sealer: &dyn FrameSealer,
 ) -> Result<Vec<u8>> {
-  let mut pack_salt = [0_u8; 32];
-  getrandom::fill(&mut pack_salt).map_err(|error| Error::Other(error.to_string()))?;
   let records = records(&objects);
-  let mut index = Zeroizing::new(index::compress_index(&index::encode_decoded_index(root_recipe, &records))?);
-  let mut header = header(
-    tag,
-    logical_pack_id_records(root_recipe, &records),
-    true,
-    pack_salt,
-    sealer.key_slot(),
-    index.len() + 16,
-  )?;
-  let context = SealedRecordContext::index(&header);
-  let tag = sealer.seal_record(&context, &mut index)?;
-  index.extend_from_slice(&tag);
-  header.index_digest = stored_index_digest(&header, &index);
+  let (header, index) = sealed_header_and_index(tag, root_recipe, &records, sealer)?;
   let mut output = header.encode().to_vec();
   output.extend_from_slice(&index);
   for (object, record) in objects.iter().zip(&records) {
     seal_payload(&mut output, &header, record, &object.stored_bytes, sealer)?;
   }
   Ok(output)
+}
+
+#[cfg(feature = "sealed-encryption")]
+pub(super) fn reseal_plain_as_encrypted_bytes(
+  source: &[u8],
+  root_recipe: Hash32,
+  records: Vec<DirectoryRecord>,
+  target_tag: SealedPackTag,
+  sealer: &dyn FrameSealer,
+) -> Result<Vec<u8>> {
+  let (header, index) = sealed_header_and_index(target_tag, root_recipe, &records, sealer)?;
+  let mut output = header.encode().to_vec();
+  output.extend_from_slice(&index);
+  for record in &records {
+    let stored = checked_slice(source, record.payload_offset, record.stored_length, "plain payload")?;
+    seal_payload(&mut output, &header, record, stored, sealer)?;
+  }
+  Ok(output)
+}
+
+#[cfg(feature = "sealed-encryption")]
+fn sealed_header_and_index(
+  tag: SealedPackTag,
+  root_recipe: Hash32,
+  records: &[DirectoryRecord],
+  sealer: &dyn FrameSealer,
+) -> Result<(Header, Zeroizing<Vec<u8>>)> {
+  let mut pack_salt = [0_u8; 32];
+  getrandom::fill(&mut pack_salt).map_err(|error| Error::Other(error.to_string()))?;
+  let mut index = Zeroizing::new(index::compress_index(&index::encode_decoded_index(root_recipe, records))?);
+  let mut header = header(
+    tag,
+    logical_pack_id_records(root_recipe, records),
+    true,
+    pack_salt,
+    sealer.key_slot(),
+    index.len() + 16,
+  )?;
+  let context = SealedRecordContext::index(&header);
+  let index_tag = sealer.seal_record(&context, &mut index)?;
+  index.extend_from_slice(&index_tag);
+  header.index_digest = stored_index_digest(&header, &index);
+  Ok((header, index))
 }
 
 fn header(

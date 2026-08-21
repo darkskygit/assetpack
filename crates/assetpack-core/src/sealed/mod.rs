@@ -8,7 +8,7 @@ mod reader;
 mod tests;
 
 #[cfg(feature = "sealed-encryption")]
-use builder::build_encrypted_bytes;
+use builder::{build_encrypted_bytes, reseal_plain_as_encrypted_bytes};
 use builder::{build_plain_bytes, validated_objects};
 #[cfg(feature = "sealed-encryption")]
 pub use crypto::{FrameSealer, FrameUnsealer, SealedRecordContext, SoftwareFrameKey};
@@ -130,6 +130,20 @@ impl SealedPackBuilder {
     }
     let objects = validated_objects(root_recipe, objects)?;
     build_encrypted_bytes(tag, root_recipe, objects, sealer)
+  }
+
+  #[cfg(feature = "sealed-encryption")]
+  pub fn reseal_plain_as_encrypted(
+    source: &[u8],
+    source_tag: SealedPackTag,
+    target_tag: SealedPackTag,
+    sealer: &dyn FrameSealer,
+  ) -> Result<Vec<u8>> {
+    if target_tag == DEFAULT_FORMAT_TAG {
+      return Err(invalid("encrypted packs require a product-specific tag"));
+    }
+    let reader = ParsedSealedPack::open(source, source_tag, PackOpenPolicy::PlainAllowed)?.open_plain()?;
+    reseal_plain_as_encrypted_bytes(source, reader.root_recipe(), reader.records, target_tag, sealer)
   }
 }
 

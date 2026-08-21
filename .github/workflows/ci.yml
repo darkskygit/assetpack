@@ -22,7 +22,9 @@ jobs:
       - name: Feature matrix
         run: |
           cargo check -p assetpack-core --no-default-features --features sealed
-          cargo check -p assetpack-core --no-default-features --features sqlite
+          cargo check -p assetpack-core --no-default-features --features sqlite-pack
+          cargo check -p assetpack-core --no-default-features --features rusqlite-store
+          cargo check -p assetpack-core --no-default-features --features sqlx-store
           cargo check -p assetpack-core --no-default-features --features file-transform
           cargo check -p assetpack-core --no-default-features --features sealed-encryption
       - run: cargo check --manifest-path fuzz/Cargo.toml --all-targets

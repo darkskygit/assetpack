@@ -6,8 +6,8 @@ use super::*;
 use crate::ObjectSource;
 use crate::{Codec, Hash32, ObjectKind, ObjectRecord, TRANSFORM_ID_NONE, TRANSFORM_VERSION_NONE, build_recipe, codec::compress};
 
-const PRODUCT_TAG: SealedPackTag = SealedPackTag(*b"gcr-product-v1!!");
-const OTHER_TAG: SealedPackTag = SealedPackTag(*b"ofr-product-v1!!");
+const PRODUCT_TAG: SealedPackTag = SealedPackTag(*b"some-product-v1!");
+const OTHER_TAG: SealedPackTag = SealedPackTag(*b"other-product-v1");
 
 struct Fixture {
   root: Hash32,
@@ -879,4 +879,105 @@ fn frame_contexts_are_unique() {
     }
   }
   assert_eq!(contexts.len(), expected);
+}
+
+#[cfg(feature = "sealed-encryption")]
+#[test]
+fn reseal_rejects_wrong_tags_and_encrypted_source() {
+  let fixture = fixture(Codec::Raw, 1024);
+  let key = software_key(31, 6);
+  let plain = SealedPackBuilder::build_plain(DEFAULT_FORMAT_TAG, fixture.root, fixture.objects.clone()).unwrap();
+  assert!(SealedPackBuilder::reseal_plain_as_encrypted(&plain, OTHER_TAG, PRODUCT_TAG, &key).is_err());
+  assert!(SealedPackBuilder::reseal_plain_as_encrypted(&plain, DEFAULT_FORMAT_TAG, DEFAULT_FORMAT_TAG, &key).is_err());
+  let encrypted = SealedPackBuilder::build_encrypted(PRODUCT_TAG, fixture.root, fixture.objects, &key).unwrap();
+  assert!(SealedPackBuilder::reseal_plain_as_encrypted(&encrypted, PRODUCT_TAG, OTHER_TAG, &key).is_err());
+}
+
+#[cfg(feature = "sealed-encryption")]
+#[test]
+fn reseal_rejects_malformed_truncated_and_noncanonical_sources() {
+  let fixture = fixture(Codec::Raw, 4097);
+  let key = software_key(37, 11);
+  let plain = SealedPackBuilder::build_plain(DEFAULT_FORMAT_TAG, fixture.root, fixture.objects).unwrap();
+  assert!(SealedPackBuilder::reseal_plain_as_encrypted(&[], DEFAULT_FORMAT_TAG, PRODUCT_TAG, &key).is_err());
+  for truncated in [HEADER_BYTES - 1, HEADER_BYTES, plain.len() - 1] {
+    assert!(
+      SealedPackBuilder::reseal_plain_as_encrypted(&plain[..truncated], DEFAULT_FORMAT_TAG, PRODUCT_TAG, &key).is_err(),
+      "truncation at {truncated} was accepted"
+    );
+  }
+  let mut corrupt_index = plain.clone();
+  corrupt_index[HEADER_BYTES] ^= 1;
+  assert!(SealedPackBuilder::reseal_plain_as_encrypted(&corrupt_index, DEFAULT_FORMAT_TAG, PRODUCT_TAG, &key).is_err());
+  let mut trailing = plain.clone();
+  trailing.extend_from_slice(b"trailing-garbage");
+  assert!(SealedPackBuilder::reseal_plain_as_encrypted(&trailing, DEFAULT_FORMAT_TAG, PRODUCT_TAG, &key).is_err());
+  let mut wrong_root = plain.clone();
+  mutate_plain_index(&mut wrong_root, |index| index[..32].fill(0xA5));
+  assert!(SealedPackBuilder::reseal_plain_as_encrypted(&wrong_root, DEFAULT_FORMAT_TAG, PRODUCT_TAG, &key).is_err());
+  let mut gap = plain.clone();
+  mutate_plain_index(&mut gap, |index| {
+    let stored = u64::from_le_bytes(index[32 + 42..32 + 50].try_into().unwrap());
+    index[32 + 42..32 + 50].copy_from_slice(&(stored - 1).to_le_bytes());
+  });
+  assert!(SealedPackBuilder::reseal_plain_as_encrypted(&gap, DEFAULT_FORMAT_TAG, PRODUCT_TAG, &key).is_err());
+}
+
+#[cfg(feature = "sealed-encryption")]
+#[test]
+fn reseal_preserves_identity_and_object_reads_across_frame_boundaries() {
+  let key = software_key(47, 13);
+  for size in [0, 1, MAX_ENCRYPTED_FRAME_BYTES, MAX_ENCRYPTED_FRAME_BYTES + 1] {
+    let fixture = fixture(Codec::Raw, size);
+    let plain = SealedPackBuilder::build_plain(DEFAULT_FORMAT_TAG, fixture.root, fixture.objects).unwrap();
+    let source = open_plain(&plain, DEFAULT_FORMAT_TAG);
+    let first = SealedPackBuilder::reseal_plain_as_encrypted(&plain, DEFAULT_FORMAT_TAG, PRODUCT_TAG, &key).unwrap();
+    let second = SealedPackBuilder::reseal_plain_as_encrypted(&plain, DEFAULT_FORMAT_TAG, PRODUCT_TAG, &key).unwrap();
+    assert_ne!(first, second, "size {size}");
+    assert_eq!(
+      ParsedSealedPack::open(&first, PRODUCT_TAG, PackOpenPolicy::EncryptedRequired)
+        .unwrap()
+        .pack_id(),
+      source.pack_id(),
+      "size {size}"
+    );
+    assert_eq!(
+      ParsedSealedPack::open(&second, PRODUCT_TAG, PackOpenPolicy::EncryptedRequired)
+        .unwrap()
+        .pack_id(),
+      source.pack_id(),
+      "size {size}"
+    );
+    for packed in [&first, &second] {
+      let reader = ParsedSealedPack::open(packed, PRODUCT_TAG, PackOpenPolicy::EncryptedRequired)
+        .unwrap()
+        .unlock(&key)
+        .unwrap();
+      assert_eq!(reader.root_recipe(), fixture.root, "size {size}");
+      reader.verify_all_objects().unwrap();
+      for record in &source.records {
+        let expected = source.read_object(&record.hash).unwrap().unwrap();
+        let actual = reader.read_object(&record.hash).unwrap().unwrap();
+        assert_eq!(actual.hash, expected.hash, "size {size}");
+        assert_eq!(actual.kind, expected.kind, "size {size}");
+        assert_eq!(actual.bytes, expected.bytes, "size {size}");
+      }
+    }
+  }
+}
+
+#[cfg(feature = "sealed-encryption")]
+#[test]
+fn reseal_copies_corrupt_stored_bytes_which_fail_object_verification() {
+  let fixture = fixture(Codec::Raw, 4097);
+  let key = software_key(53, 14);
+  let mut plain = SealedPackBuilder::build_plain(DEFAULT_FORMAT_TAG, fixture.root, fixture.objects).unwrap();
+  let last = plain.len() - 1;
+  plain[last] ^= 1;
+  let resealed = SealedPackBuilder::reseal_plain_as_encrypted(&plain, DEFAULT_FORMAT_TAG, PRODUCT_TAG, &key).unwrap();
+  let reader = ParsedSealedPack::open(&resealed, PRODUCT_TAG, PackOpenPolicy::EncryptedRequired)
+    .unwrap()
+    .unlock(&key)
+    .unwrap();
+  assert!(matches!(reader.verify_all_objects(), Err(crate::Error::ObjectHashMismatch { .. })));
 }
