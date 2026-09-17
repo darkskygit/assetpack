@@ -40,17 +40,17 @@ fn transform_stored_stream_fixtures_are_stable_and_restore_original_bytes() {
     (
       Some(&precomp2),
       143,
-      "99cca30649070fdc348f6ef07df83cfef77aa1500e4efce7a3a95541ab100e1e",
+      "096f5d3ac56ddbbfff3496dc86ead0ab748edcdf887a56f946bdb87feab7ba11",
     ),
     (
       Some(&precomp2_zstd),
-      120,
-      "9382c30307a03e67c707f746c8212f5985749c4949e4b106a38f315c3461d299",
+      121,
+      "d1f83a4bb737fa8cb9a95700923818413a5ed1a7cf829fe4201f230c0dffbf5f",
     ),
     (
       Some(&precomp2_lzma),
       113,
-      "8d8557ac3408ffce005f327a11c1a988a477f0bef10e924ff0c396c3e654b8e2",
+      "992791cc4c1d2b855a7a71a7c1f3d273e541edbe23a1a893a077738d790d6c39",
     ),
   ];
   for (transform, expected_len, expected_hash) in transforms {
@@ -86,6 +86,9 @@ fn decoder_registry_contains_every_persisted_precomp2_pair() {
     (TRANSFORM_ID_PRECOMP2, 1),
     (TRANSFORM_ID_PRECOMP2_ZSTD, 1),
     (TRANSFORM_ID_PRECOMP2_LZMA, 1),
+    (TRANSFORM_ID_PRECOMP2, 2),
+    (TRANSFORM_ID_PRECOMP2_ZSTD, 2),
+    (TRANSFORM_ID_PRECOMP2_LZMA, 2),
   ] {
     let decoder = registry.get(id, version).unwrap();
     assert_eq!((decoder.id(), decoder.version()), (id, version));
@@ -116,8 +119,11 @@ async fn file_reader_restores_all_fixed_transform_recipes() {
   let transforms: Vec<(u16, u16, Option<&dyn FileTransform>)> = vec![
     (TRANSFORM_ID_NONE, 0, None),
     (TRANSFORM_ID_PRECOMP2, 1, Some(&precomp2)),
+    (TRANSFORM_ID_PRECOMP2, 2, Some(&precomp2)),
     (TRANSFORM_ID_PRECOMP2_ZSTD, 1, Some(&precomp2_zstd)),
+    (TRANSFORM_ID_PRECOMP2_ZSTD, 2, Some(&precomp2_zstd)),
     (TRANSFORM_ID_PRECOMP2_LZMA, 1, Some(&precomp2_lzma)),
+    (TRANSFORM_ID_PRECOMP2_LZMA, 2, Some(&precomp2_lzma)),
   ];
   let expected_hash = Hash32::sha3_256(TINY_PNG);
   assert_eq!(
@@ -222,7 +228,10 @@ fn precomp2_encode_config_enables_features() {
   let encode = crate::common::precomp2_encode_config(&config);
   assert!(encode.enable_png_webp);
   assert!(encode.enable_pdf_predictor);
-  assert!(encode.enable_pdf_bmp_fallback);
+  assert!(encode.enable_pdf_dct);
+  assert!(encode.enable_pdf_ascii);
+  assert!(encode.enable_pdf_images);
+  assert_eq!(encode.max_pdf_filters, config.max_pdf_filters);
 }
 
 #[test]
@@ -298,4 +307,69 @@ fn selector_accepts_precomp2_family_with_negative_gain() {
     "unexpected transform id {}",
     selection.transform_id
   );
+}
+
+#[test]
+fn pdf_v2_shared_candidates_restore_from_plain_pack() {
+  use assetpack_core::{
+    Codec,
+    file_transform::{TransformEncodeContext, TransformSelection},
+    pipeline::{DefaultChunkCompressor, Pipeline},
+  };
+  let length = 8193usize;
+  let mut pdf = format!("%PDF-1.7\n1 0 obj << /Length {length} /Filter /ASCIIHexDecode >> stream\n").into_bytes();
+  pdf.extend_from_slice(&b"41".repeat(4096));
+  pdf.extend_from_slice(b">\nendstream\nendobj\n%%EOF\n");
+  let config = FileTransformConfig::default();
+  let registry = TransformDecoderRegistry::new(crate::default_decoders(&config)).unwrap();
+  let mut context = TransformEncodeContext::default();
+  for spec in crate::default_specs() {
+    let transform = (spec.build)(&config);
+    let mut shared = Vec::new();
+    transform.encode_with_context(&pdf, &mut shared, &mut context).unwrap();
+    let mut standalone = Vec::new();
+    transform.encode(&mut Cursor::new(&pdf), &mut standalone).unwrap();
+    assert_eq!(shared, standalone);
+    assert_eq!(transform.version(), 2);
+    let original_hash = Hash32::sha3_256(&pdf);
+    let selection = TransformSelection {
+      transform_id: transform.id(),
+      transform_version: transform.version(),
+      original_size: pdf.len() as u64,
+      original_hash,
+      stored_stream: shared,
+    };
+    let plan = Pipeline::new(Default::default())
+      .run_with_selection(selection, Some("pdf"), &DefaultChunkCompressor)
+      .unwrap();
+    let refs = plan.chunks.iter().map(|chunk| (chunk.hash, chunk.raw_len)).collect::<Vec<_>>();
+    let recipe = build_recipe(pdf.len() as u64, &refs, original_hash, transform.id(), transform.version());
+    let recipe_hash = Hash32::sha3_256(&recipe);
+    let mut objects = BTreeMap::new();
+    for chunk in plan.chunks {
+      objects.insert(
+        chunk.hash,
+        ObjectRecord {
+          hash: chunk.hash,
+          kind: ObjectKind::Chunk,
+          decoded_len: chunk.raw_len as u64,
+          codec: chunk.codec,
+          stored_bytes: chunk.payload.unwrap(),
+        },
+      );
+    }
+    objects.insert(
+      recipe_hash,
+      ObjectRecord {
+        hash: recipe_hash,
+        kind: ObjectKind::Recipe,
+        decoded_len: recipe.len() as u64,
+        codec: Codec::Raw,
+        stored_bytes: recipe,
+      },
+    );
+    let bytes = SealedPackBuilder::build_plain(DEFAULT_FORMAT_TAG, recipe_hash, objects.into_values()).unwrap();
+    let parsed = ParsedSealedPack::open(&bytes, DEFAULT_FORMAT_TAG, PackOpenPolicy::PlainAllowed).unwrap();
+    assert_eq!(read_file(&parsed.open_plain().unwrap(), &registry, recipe_hash), pdf);
+  }
 }

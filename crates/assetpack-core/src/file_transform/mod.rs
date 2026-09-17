@@ -33,6 +33,33 @@ pub struct TransformStats {
 pub trait FileTransform: TransformDecoder {
   fn quick_check(&self, hint: &FileHint) -> bool;
   fn encode(&self, input: &mut dyn std::io::BufRead, out: &mut dyn std::io::Write) -> crate::Result<TransformStats>;
+
+  fn encode_with_context(
+    &self,
+    input: &[u8],
+    out: &mut dyn std::io::Write,
+    _context: &mut TransformEncodeContext,
+  ) -> crate::Result<TransformStats> {
+    self.encode(&mut std::io::Cursor::new(input), out)
+  }
+}
+
+/// A preparation cache belonging to one input and one selector invocation.
+/// Never reuse it for another input: keys identify settings, not file contents.
+#[derive(Default)]
+pub struct TransformEncodeContext {
+  prepared: std::collections::HashMap<String, Vec<u8>>,
+}
+
+impl TransformEncodeContext {
+  /// Keys must include the transform namespace and all preparation settings.
+  pub fn get_or_prepare(&mut self, key: String, prepare: impl FnOnce() -> crate::Result<Vec<u8>>) -> crate::Result<&[u8]> {
+    use std::collections::hash_map::Entry;
+    Ok(match self.prepared.entry(key) {
+      Entry::Occupied(entry) => entry.into_mut(),
+      Entry::Vacant(entry) => entry.insert(prepare()?),
+    })
+  }
 }
 
 #[derive(Clone)]
@@ -90,6 +117,6 @@ pub use config::{
   FileTransformConfig, FileTransformEvalConfig, FileTransformPrecomp2Config, FileTransformPrecomp2LzmaConfig,
   FileTransformPrecomp2ZstdConfig,
 };
-pub use selector::TransformSelector;
+pub use selector::{CandidateOutcome, CandidateReport, SelectionReport, TransformSelector};
 pub use spool::{StoredStreamReader, StoredStreamSpool};
 pub use transforms::TransformSpec;

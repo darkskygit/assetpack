@@ -4,17 +4,17 @@ package.edition = "2024"
 resolver        = "2"
 
   [workspace.dependencies]
-  assetpack-core = { version = "0.3", path = "crates/assetpack-core" }
-  brotli = "8.0"
+  assetpack-core = { version = "0.4", path = "crates/assetpack-core" }
+  brotli = "9.0"
   chrono = "0.4"
-  fastcdc = "4.0"
+  fastcdc = "5.0"
   futures-core = "0.3"
   futures-util = "0.3"
   hex = "0.4"
   lzma-rust2 = "0.16"
-  precomp2 = "0.1"
+  precomp2 = "0.2"
   rand = "0.10"
-  rusqlite = "0.32.1"
+  rusqlite = "0.39"
   serde = { version = "1.0", features = ["derive"] }
   sha3 = "0.12"
   sqlx = { version = "0.9", default-features = false, features = [
@@ -25,4 +25,4 @@ resolver        = "2"
   tempfile = "3.27"
   thiserror = "2.0"
   tokio = { version = "1.53", features = ["fs", "sync"] }
-  zstd = "0.13"
+  zstd = "0.14"
