@@ -2,10 +2,10 @@ use std::io::{BufRead, Write};
 
 use assetpack_core::{
   TRANSFORM_ID_PRECOMP2_LZMA, TRANSFORM_VERSION_PRECOMP2_LZMA, TransformDecoder,
-  file_transform::{FileHint, FileTransform, FileTransformConfig, TransformStats},
+  file_transform::{FileHint, FileTransform, FileTransformConfig, TransformEncodeContext, TransformStats},
 };
 
-use crate::common::{
+use super::{
   TransformGate, clamp_dict_size, lzma_compress, lzma_decompress, precomp2_decode_bytes, precomp2_decode_config, precomp2_encode_bytes,
   precomp2_encode_config, read_all,
 };
@@ -50,6 +50,21 @@ impl TransformDecoder for Precomp2LzmaTransform {
 }
 
 impl FileTransform for Precomp2LzmaTransform {
+  fn encode_with_context(
+    &self,
+    input: &[u8],
+    out: &mut dyn Write,
+    context: &mut TransformEncodeContext,
+  ) -> assetpack_core::Result<TransformStats> {
+    let encoded = super::prepare_precomp2(input, &self.encode_config, context)?;
+    let compressed = lzma_compress(encoded, self.preset, self.dict_size)?;
+    out.write_all(&compressed)?;
+    Ok(TransformStats {
+      input_bytes: input.len() as u64,
+      output_bytes: compressed.len() as u64,
+    })
+  }
+
   fn quick_check(&self, hint: &FileHint) -> bool {
     self.gate.quick_check(hint)
   }

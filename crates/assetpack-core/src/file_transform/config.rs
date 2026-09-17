@@ -83,6 +83,11 @@ pub struct FileTransformPrecomp2Config {
   pub max_expand_ratio: f64,
   pub max_total_output: u64,
   pub recover: bool,
+  pub enable_pdf_dct: bool,
+  pub enable_pdf_ascii: bool,
+  pub enable_pdf_predictor: bool,
+  pub enable_pdf_images: bool,
+  pub max_pdf_filters: u32,
 }
 
 impl Default for FileTransformPrecomp2Config {
@@ -93,6 +98,11 @@ impl Default for FileTransformPrecomp2Config {
       max_expand_ratio: 16.0,
       max_total_output: 1 << 32,
       recover: false,
+      enable_pdf_dct: true,
+      enable_pdf_ascii: true,
+      enable_pdf_predictor: true,
+      enable_pdf_images: true,
+      max_pdf_filters: 16,
     }
   }
 }

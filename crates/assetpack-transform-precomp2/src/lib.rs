@@ -13,6 +13,11 @@ use assetpack_core::{
   TRANSFORM_ID_PRECOMP2, TRANSFORM_ID_PRECOMP2_LZMA, TRANSFORM_ID_PRECOMP2_ZSTD, TransformDecoder,
   file_transform::{FileTransform, FileTransformConfig, TransformSpec},
 };
+use common::{
+  TransformGate, clamp_dict_size, lzma_compress, lzma_decompress, precomp2_decode_bytes, precomp2_decode_config, precomp2_encode_bytes,
+  precomp2_encode_config, prepare_precomp2, read_all, zstd_compress, zstd_decompress,
+};
+use guards::{magic_match, precomp2_guard};
 pub use precomp2::Precomp2Transform;
 pub use precomp2_lzma::Precomp2LzmaTransform;
 pub use precomp2_zstd::Precomp2ZstdTransform;
@@ -70,10 +75,34 @@ pub fn default_specs() -> Vec<TransformSpec> {
   ]
 }
 
+/// Registers current v2 writers' decoders and v1 recipe aliases. PCF2 describes
+/// its own version; the shared reader supports both without changing Recipe or
+/// SealedPack framing. Encoder selection exposes only the current version.
 pub fn default_decoders(config: &FileTransformConfig) -> Vec<Arc<dyn TransformDecoder>> {
-  vec![
+  let mut decoders: Vec<Arc<dyn TransformDecoder>> = vec![
     Arc::new(Precomp2Transform::new(config)),
     Arc::new(Precomp2ZstdTransform::new(config)),
     Arc::new(Precomp2LzmaTransform::new(config)),
-  ]
+  ];
+  let legacy = decoders
+    .iter()
+    .cloned()
+    .map(|decoder| Arc::new(LegacyDecoder(decoder)) as Arc<dyn TransformDecoder>)
+    .collect::<Vec<_>>();
+  decoders.extend(legacy);
+  decoders
+}
+
+struct LegacyDecoder(Arc<dyn TransformDecoder>);
+
+impl TransformDecoder for LegacyDecoder {
+  fn id(&self) -> u16 {
+    self.0.id()
+  }
+  fn version(&self) -> u16 {
+    1
+  }
+  fn decode(&self, input: &mut dyn std::io::BufRead, out: &mut dyn std::io::Write) -> assetpack_core::Result<()> {
+    self.0.decode(input, out)
+  }
 }

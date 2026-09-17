@@ -7,9 +7,9 @@ pub const TRANSFORM_ID_PRECOMP2: u16 = 1;
 pub const TRANSFORM_ID_PRECOMP2_ZSTD: u16 = 2;
 pub const TRANSFORM_ID_PRECOMP2_LZMA: u16 = 3;
 pub const TRANSFORM_VERSION_NONE: u16 = 0;
-pub const TRANSFORM_VERSION_PRECOMP2: u16 = 1;
-pub const TRANSFORM_VERSION_PRECOMP2_ZSTD: u16 = 1;
-pub const TRANSFORM_VERSION_PRECOMP2_LZMA: u16 = 1;
+pub const TRANSFORM_VERSION_PRECOMP2: u16 = 2;
+pub const TRANSFORM_VERSION_PRECOMP2_ZSTD: u16 = 2;
+pub const TRANSFORM_VERSION_PRECOMP2_LZMA: u16 = 2;
 
 pub trait TransformDecoder: Send + Sync {
   fn id(&self) -> u16;

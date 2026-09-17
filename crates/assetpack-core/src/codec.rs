@@ -6,7 +6,9 @@ use crate::error::{Error, Result};
 
 pub const SAMPLE_LIMIT: usize = 64 * 1024;
 const COMPRESSED_WHITELIST: &[&str] = &[
-  "jpg", "jpeg", "png", "webp", "zip", "epub", "gz", "tgz", "bz2", "xz", "br", "zst", "mp4", "mov", "pdf",
+  // PDF is a mixed container: let its untransformed chunks use content-based
+  // selection instead of forcing Raw for compressible text/vector streams.
+  "jpg", "jpeg", "png", "webp", "zip", "epub", "gz", "tgz", "bz2", "xz", "br", "zst", "mp4", "mov",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,6 +144,15 @@ mod tests {
     let (codec, compressed) = compress_auto(&data, None).unwrap();
     assert_eq!(codec, Codec::Brotli);
     assert!(compressed.len() < data.len());
+  }
+
+  #[test]
+  fn pdf_fallback_uses_content_not_extension() {
+    let data = b"%PDF-1.7\nBT (repeated text) Tj ET\n".repeat(1024);
+    assert_eq!(compress_auto(&data, Some("pdf")).unwrap(), compress_auto(&data, None).unwrap());
+    assert_ne!(compress_auto(&data, Some("pdf")).unwrap().0, Codec::Raw);
+    let noise = (0..256).cycle().take(65536).map(|n| n as u8).collect::<Vec<_>>();
+    assert_eq!(decide_codec(&noise, Some("pdf")), Codec::Raw);
   }
 
   #[test]

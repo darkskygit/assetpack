@@ -5,12 +5,12 @@ use std::{
 
 use assetpack_core::{
   error::{Error, Result},
-  file_transform::{FileHint, FileTransformConfig, FileTransformPrecomp2Config},
+  file_transform::{FileHint, FileTransformConfig, FileTransformPrecomp2Config, TransformEncodeContext},
 };
 use lzma_rust2::{DICT_SIZE_MAX, DICT_SIZE_MIN, Lzma2Options, Lzma2Reader, Lzma2Writer};
 use precomp2::{DecodeConfig as Precomp2DecodeConfig, EncodeConfig as Precomp2EncodeConfig};
 
-use crate::guards::{magic_match, precomp2_guard};
+use super::{magic_match, precomp2_guard};
 
 #[derive(Debug, Clone)]
 pub(crate) struct TransformGate {
@@ -60,8 +60,11 @@ pub(crate) fn precomp2_encode_config(config: &FileTransformPrecomp2Config) -> Pr
     max_expand_ratio: config.max_expand_ratio,
     max_total_output: config.max_total_output,
     enable_png_webp: true,
-    enable_pdf_predictor: true,
-    enable_pdf_bmp_fallback: true,
+    enable_pdf_predictor: config.enable_pdf_predictor,
+    enable_pdf_dct: config.enable_pdf_dct,
+    enable_pdf_ascii: config.enable_pdf_ascii,
+    enable_pdf_images: config.enable_pdf_images,
+    max_pdf_filters: config.max_pdf_filters,
   }
 }
 
@@ -75,6 +78,14 @@ pub(crate) fn precomp2_decode_config(config: &FileTransformPrecomp2Config) -> Pr
 
 pub(crate) fn precomp2_encode_bytes(input: &[u8], config: &Precomp2EncodeConfig) -> Result<Vec<u8>> {
   precomp2_guard("encode", precomp2::encode_bytes(input, config))
+}
+
+pub(crate) fn prepare_precomp2<'a>(
+  input: &[u8],
+  config: &Precomp2EncodeConfig,
+  context: &'a mut TransformEncodeContext,
+) -> Result<&'a [u8]> {
+  context.get_or_prepare(format!("precomp2-v2:{config:?}"), || precomp2_encode_bytes(input, config))
 }
 
 pub(crate) fn precomp2_decode_bytes(encoded: &[u8], config: &Precomp2DecodeConfig) -> Result<Vec<u8>> {

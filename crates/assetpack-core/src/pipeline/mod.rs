@@ -48,6 +48,7 @@ pub struct PipelinePlan {
   pub original_hash: Hash32,
   pub stored_stream_size: u64,
   pub chunks: Vec<ChunkPlan>,
+  /// Chunk payloads plus recipe; excludes container overhead and dedup savings.
   pub estimated_bytes: u64,
 }
 
@@ -78,6 +79,13 @@ impl Pipeline {
     Self { config }
   }
 
+  pub(crate) fn for_evaluation(&self) -> Self {
+    Self::new(PipelineConfig {
+      discard_payload: true,
+      ..self.config.clone()
+    })
+  }
+
   pub fn run(&self, data: Vec<u8>, hint: &FileHint, original_hash: Hash32, selector: Option<&TransformSelector>) -> Result<PipelinePlan> {
     self.run_with_compressor(data, hint, original_hash, selector, &DefaultChunkCompressor)
   }
@@ -91,7 +99,7 @@ impl Pipeline {
     compressor: &dyn ChunkCompressor,
   ) -> Result<PipelinePlan> {
     let selection = if let Some(selector) = selector {
-      selector.select_bytes(data, hint, original_hash)?
+      selector.select_with_pipeline(data, hint, original_hash, self, compressor)?
     } else {
       TransformSelection::none(data, original_hash)
     };

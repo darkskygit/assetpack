@@ -21,7 +21,13 @@ pub struct FastCdcSplitter {
 
 impl FastCdcSplitter {
   pub fn new(min_size: usize, avg_size: usize, max_size: usize) -> Result<Self> {
-    if min_size == 0 || min_size > avg_size || avg_size > max_size {
+    if min_size == 0
+      || min_size > avg_size
+      || avg_size > max_size
+      || !min_size.is_multiple_of(2)
+      || !avg_size.is_multiple_of(2)
+      || !max_size.is_multiple_of(2)
+    {
       return Err(Error::InvalidCdcParams);
     }
     Ok(Self {
@@ -55,6 +61,9 @@ mod tests {
   fn rejects_invalid_params() {
     assert!(FastCdcSplitter::new(0, DEFAULT_AVG, DEFAULT_MAX).is_err());
     assert!(FastCdcSplitter::new(DEFAULT_AVG, DEFAULT_MIN, DEFAULT_MAX).is_err());
+    assert!(FastCdcSplitter::new(DEFAULT_MIN + 1, DEFAULT_AVG, DEFAULT_MAX).is_err());
+    assert!(FastCdcSplitter::new(DEFAULT_MIN, DEFAULT_AVG + 1, DEFAULT_MAX).is_err());
+    assert!(FastCdcSplitter::new(DEFAULT_MIN, DEFAULT_AVG, DEFAULT_MAX + 1).is_err());
   }
 
   #[test]

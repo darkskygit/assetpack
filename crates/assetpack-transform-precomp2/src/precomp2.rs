@@ -2,12 +2,10 @@ use std::io::{BufRead, Write};
 
 use assetpack_core::{
   TRANSFORM_ID_PRECOMP2, TRANSFORM_VERSION_PRECOMP2, TransformDecoder,
-  file_transform::{FileHint, FileTransform, FileTransformConfig, TransformStats},
+  file_transform::{FileHint, FileTransform, FileTransformConfig, TransformEncodeContext, TransformStats},
 };
 
-use crate::common::{
-  TransformGate, precomp2_decode_bytes, precomp2_decode_config, precomp2_encode_bytes, precomp2_encode_config, read_all,
-};
+use super::{TransformGate, precomp2_decode_bytes, precomp2_decode_config, precomp2_encode_bytes, precomp2_encode_config, read_all};
 
 #[derive(Debug, Clone)]
 pub struct Precomp2Transform {
@@ -44,6 +42,19 @@ impl TransformDecoder for Precomp2Transform {
 }
 
 impl FileTransform for Precomp2Transform {
+  fn encode_with_context(
+    &self,
+    input: &[u8],
+    out: &mut dyn Write,
+    context: &mut TransformEncodeContext,
+  ) -> assetpack_core::Result<TransformStats> {
+    let encoded = super::prepare_precomp2(input, &self.encode_config, context)?;
+    out.write_all(encoded)?;
+    Ok(TransformStats {
+      input_bytes: input.len() as u64,
+      output_bytes: encoded.len() as u64,
+    })
+  }
   fn quick_check(&self, hint: &FileHint) -> bool {
     self.gate.quick_check(hint)
   }

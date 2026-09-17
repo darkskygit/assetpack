@@ -1,35 +1,37 @@
 [package]
-name = "assetpack-core-fuzz"
-version = "0.0.0"
-publish = false
 edition = "2024"
+name    = "assetpack-core-fuzz"
+publish = false
+version = "0.0.0"
 
-[package.metadata]
-cargo-fuzz = true
+  [package.metadata]
+  cargo-fuzz = true
 
 [dependencies]
-assetpack-core = { path = "../crates/assetpack-core", default-features = false, features = ["sealed-encryption"] }
+assetpack-core = { path = "../crates/assetpack-core", default-features = false, features = [
+  "sealed-encryption",
+] }
 libfuzzer-sys = "0.4"
 
 [[bin]]
-name = "sealed_open_plain"
-path = "fuzz_targets/sealed_open_plain.rs"
-test = false
-doc = false
 bench = false
+doc   = false
+name  = "sealed_open_plain"
+path  = "fuzz_targets/sealed_open_plain.rs"
+test  = false
 
 [[bin]]
-name = "sealed_open_encrypted"
-path = "fuzz_targets/sealed_open_encrypted.rs"
-test = false
-doc = false
 bench = false
+doc   = false
+name  = "sealed_open_encrypted"
+path  = "fuzz_targets/sealed_open_encrypted.rs"
+test  = false
 
 [[bin]]
-name = "file_reader"
-path = "fuzz_targets/file_reader.rs"
-test = false
-doc = false
 bench = false
+doc   = false
+name  = "file_reader"
+path  = "fuzz_targets/file_reader.rs"
+test  = false
 
 [workspace]
