@@ -1,10 +1,13 @@
+mod gc;
+
 use std::collections::{HashMap, HashSet};
 
+pub use gc::{ClosureReport, GcReport};
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
 use super::{
   MerkleMode, MerkleProof, MerkleSummary, SqliteLayout, SqliteStoreOptions, StoredObjectRow, codec_to_str, hash_pair,
-  merkle_root_from_hashes, object_record_from_row, prepare_object, schema_statements, verified_object_from_row,
+  merkle_root_from_hashes, object_record_from_row, parse_recipe_checked, prepare_object, schema_statements, verified_object_from_row,
 };
 use crate::{Codec, Error, Hash32, ObjectKind, ObjectRecord, ObjectSource, Result, VerifiedObject};
 
@@ -34,6 +37,12 @@ impl<'connection> RusqliteStore<'connection> {
     for statement in schema_statements(&layout, options.merkle) {
       connection.execute_batch(&statement)?;
     }
+    Ok(Self::view(connection, options, layout))
+  }
+
+  /// Views an existing schema without running DDL or modifying the connection.
+  pub fn from_existing_connection_with_options(connection: &'connection Connection, options: SqliteStoreOptions) -> Result<Self> {
+    let layout = SqliteLayout::new(options.namespace.as_deref())?;
     Ok(Self::view(connection, options, layout))
   }
 

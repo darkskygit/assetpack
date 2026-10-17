@@ -1,3 +1,5 @@
+mod merkle;
+
 use std::{
   collections::{HashMap, HashSet},
   path::Path,
@@ -20,8 +22,6 @@ use crate::{
   hash::Hash32,
   object::{AsyncObjectSource, ObjectKind, ObjectRecord, VerifiedObject},
 };
-
-mod merkle;
 
 const SQLITE_PARAM_LIMIT: usize = 999;
 const OBJECT_COLUMNS: usize = 7;

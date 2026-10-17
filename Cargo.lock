@@ -56,7 +56,7 @@ checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 
 [[package]]
 name = "assetpack-core"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "brotli",
  "chacha20poly1305",
@@ -82,7 +82,7 @@ dependencies = [
 
 [[package]]
 name = "assetpack-transform-precomp2"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "assetpack-core",
  "lzma-rust2",
@@ -1095,6 +1095,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
+name = "lz4_flex"
+version = "0.11.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "373f5eceeeab7925e0c1098212f2fbc4d416adec9d35051a6ab251e824c1854a"
+dependencies = [
+ "twox-hash",
+]
+
+[[package]]
 name = "lzma-rust2"
 version = "0.16.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1233,14 +1242,15 @@ dependencies = [
 
 [[package]]
 name = "precomp2"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b3ea37cea650ab668239fba9e3e9ebfbbb8bfcd57c1f8bd0d776cd38be957544"
+checksum = "528ac0db19f41806121f5b7c25445997f321c878cf0f3cd58df8dbebe8f31a04"
 dependencies = [
  "base64 0.23.1",
  "bzip2",
  "crc32fast",
  "lepton_jpeg",
+ "lz4_flex",
  "memchr",
  "preflate-rs",
  "thiserror",
@@ -1897,6 +1907,12 @@ checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 dependencies = [
  "once_cell",
 ]
+
+[[package]]
+name = "twox-hash"
+version = "2.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "86a801b3cea342a06d468c8710662aa29e5e05e4f5c0d62f00bbb7f2ad7941c2"
 
 [[package]]
 name = "typenum"

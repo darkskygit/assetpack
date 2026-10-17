@@ -373,3 +373,68 @@ fn pdf_v2_shared_candidates_restore_from_plain_pack() {
     assert_eq!(read_file(&parsed.open_plain().unwrap(), &registry, recipe_hash), pdf);
   }
 }
+
+/// Minimal v6 UnityFS bundle with one LZ4HC storage block that the 1.10.0
+/// compressor reproduces, so the container codec converts it.
+fn build_unityfs_fixture() -> Vec<u8> {
+  let payload = b"unityfs asset payload with some repetition; ".repeat(2000);
+  let compressed = precomp2::codec::lz4::Compressor::V1_10_0_L12
+    .compress(&payload, payload.len() + 16)
+    .expect("compress fixture block");
+
+  let mut info = Vec::new();
+  info.extend_from_slice(&[0u8; 16]);
+  info.extend_from_slice(&1u32.to_be_bytes());
+  info.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+  info.extend_from_slice(&(compressed.len() as u32).to_be_bytes());
+  info.extend_from_slice(&3u16.to_be_bytes());
+  info.extend_from_slice(&0u32.to_be_bytes());
+
+  let mut bundle = Vec::new();
+  bundle.extend_from_slice(b"UnityFS\0");
+  bundle.extend_from_slice(&6u32.to_be_bytes());
+  bundle.extend_from_slice(b"6000.0.23f1");
+  bundle.push(0);
+  bundle.extend_from_slice(b"0.0.0f0");
+  bundle.push(0);
+  bundle.extend_from_slice(&0i64.to_be_bytes()); // size placeholder
+  bundle.extend_from_slice(&(info.len() as u32).to_be_bytes());
+  bundle.extend_from_slice(&(info.len() as u32).to_be_bytes());
+  bundle.extend_from_slice(&0u32.to_be_bytes()); // flags: uncompressed info at start
+  bundle.extend_from_slice(&info);
+  bundle.extend_from_slice(&compressed);
+  let size = bundle.len() as i64;
+  let size_offset = 8 + 4 + b"6000.0.23f1".len() + 1 + 8;
+  bundle[size_offset..size_offset + 8].copy_from_slice(&size.to_be_bytes());
+  bundle
+}
+
+#[test]
+fn unityfs_magic_selects_precomp2_and_roundtrips() {
+  let config = FileTransformConfig {
+    min_size: 0,
+    ..Default::default()
+  };
+  let transform = crate::Precomp2Transform::new(&config);
+  let bundle = build_unityfs_fixture();
+
+  let hint = FileHint {
+    size: bundle.len() as u64,
+    extension: None,
+    head: Some(bundle[..8].to_vec()),
+  };
+  assert!(transform.quick_check(&hint), "UnityFS magic must be recognized");
+
+  assert_roundtrip_keeps_hash(&transform, &bundle);
+
+  let mut encoded = Vec::new();
+  transform.encode(&mut BufReader::new(Cursor::new(&bundle)), &mut encoded).unwrap();
+  let pcf2 = precomp2::Pcf2File::decode(encoded.as_slice()).unwrap();
+  assert!(
+    pcf2
+      .segments
+      .iter()
+      .any(|segment| segment.kind == precomp2::SegmentKind::UnityFs as u8),
+    "bundle block should be converted to a UnityFs segment"
+  );
+}

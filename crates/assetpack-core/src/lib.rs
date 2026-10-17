@@ -36,10 +36,10 @@ pub use sealed::{
 };
 #[cfg(feature = "sealed-encryption")]
 pub use sealed::{FrameSealer, FrameUnsealer, SealedRecordContext, SoftwareFrameKey};
-#[cfg(feature = "rusqlite-store")]
-pub use sqlite::RusqliteStore;
 #[cfg(feature = "sqlx-store")]
 pub use sqlite::SqlxStore;
+#[cfg(feature = "rusqlite-store")]
+pub use sqlite::{ClosureReport, GcReport, RusqliteStore};
 #[cfg(any(feature = "sqlite-pack", feature = "rusqlite-store", feature = "sqlx-store"))]
 pub use sqlite::{MerkleMode, MerkleProof, MerkleSummary, SqliteStoreOptions};
 #[cfg(feature = "sqlite-pack")]

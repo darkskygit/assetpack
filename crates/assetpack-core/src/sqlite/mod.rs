@@ -1,3 +1,6 @@
+#[cfg(any(feature = "sqlite-pack", feature = "rusqlite-store"))]
+use crate::parse_recipe_checked;
+
 mod common;
 #[cfg(feature = "sqlite-pack")]
 mod pack;
@@ -15,13 +18,15 @@ pub(in crate::sqlite) use common::{
 #[cfg(feature = "sqlite-pack")]
 pub use pack::{SqlitePack, SqlitePackJournalMode};
 #[cfg(any(feature = "sqlite-pack", feature = "rusqlite-store"))]
-pub use rusqlite::RusqliteStore;
+pub use rusqlite::{ClosureReport, GcReport, RusqliteStore};
 #[cfg(feature = "sqlx-store")]
 pub use sqlx::SqlxStore;
 
 #[cfg(all(test, feature = "rusqlite-store"))]
 mod tests {
-  use super::{RusqliteStore, SqliteStoreOptions};
+  use super::RusqliteStore;
+  #[cfg(feature = "sqlx-store")]
+  use super::SqliteStoreOptions;
   use crate::{Codec, Hash32, ObjectKind, ObjectRecord, ObjectSource};
 
   fn record(bytes: &[u8]) -> ObjectRecord {

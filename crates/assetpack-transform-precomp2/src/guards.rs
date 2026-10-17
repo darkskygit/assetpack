@@ -5,7 +5,12 @@ pub(crate) fn magic_match(head: &[u8]) -> bool {
   const GZIP_MAGIC: &[u8] = b"\x1f\x8b";
   const ZIP_MAGIC: &[u8] = b"PK\x03\x04";
   const PDF_MAGIC: &[u8] = b"%PDF";
-  head.starts_with(PNG_MAGIC) || head.starts_with(GZIP_MAGIC) || head.starts_with(ZIP_MAGIC) || head.starts_with(PDF_MAGIC)
+  const UNITYFS_MAGIC: &[u8] = b"UnityFS\0";
+  head.starts_with(PNG_MAGIC)
+    || head.starts_with(GZIP_MAGIC)
+    || head.starts_with(ZIP_MAGIC)
+    || head.starts_with(PDF_MAGIC)
+    || head.starts_with(UNITYFS_MAGIC)
 }
 
 pub(crate) fn precomp2_guard<T>(context: &'static str, result: precomp2::Result<T>) -> Result<T> {
