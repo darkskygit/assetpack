@@ -122,7 +122,8 @@ pub(crate) fn precomp2_encode_config(config: &FileTransformPrecomp2Config) -> Pr
     max_depth: config.max_depth,
     max_expand_ratio: config.max_expand_ratio,
     max_total_output: config.max_total_output,
-    enable_png_webp: true,
+    enable_png_webp: config.enable_png_webp,
+    max_webp_pixels: config.max_webp_pixels,
     enable_pdf_predictor: config.enable_pdf_predictor,
     enable_pdf_dct: config.enable_pdf_dct,
     enable_pdf_ascii: config.enable_pdf_ascii,
@@ -137,6 +138,21 @@ pub(crate) fn precomp2_decode_config(config: &FileTransformPrecomp2Config) -> Pr
     max_total_output: config.max_total_output,
     recover: config.recover,
   }
+}
+
+/// Tightens `config.max_total_output` and the intermediate stream cap relative
+/// to a recipe's declared `original_file_size`.
+pub(crate) fn tighten_decode_config(
+  config: &Precomp2DecodeConfig,
+  max_mid_bytes: u64,
+  original_file_size: u64,
+) -> (Precomp2DecodeConfig, u64) {
+  let size_cap = original_file_size.saturating_mul(16).max(2 * 1024 * 1024);
+  let max_total_output = config.max_total_output.min(size_cap);
+  let tightened_mid = max_mid_bytes.min(max_total_output.saturating_add(MID_STREAM_SLACK_BYTES));
+  let mut tightened = config.clone();
+  tightened.max_total_output = max_total_output;
+  (tightened, tightened_mid)
 }
 
 pub(crate) fn precomp2_encode_bytes(input: &[u8], config: &Precomp2EncodeConfig) -> Result<Vec<u8>> {

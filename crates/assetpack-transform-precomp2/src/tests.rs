@@ -219,6 +219,7 @@ fn base_precomp2_config_defaults_match_precomp2_defaults() {
   assert_eq!(config.max_depth, encode.max_depth);
   assert_eq!(config.max_expand_ratio, encode.max_expand_ratio);
   assert_eq!(config.max_total_output, encode.max_total_output);
+  assert_eq!(config.max_webp_pixels, encode.max_webp_pixels);
   assert_eq!(config.recover, decode.recover);
 }
 
@@ -227,11 +228,21 @@ fn precomp2_encode_config_enables_features() {
   let config = FileTransformPrecomp2Config::default();
   let encode = crate::common::precomp2_encode_config(&config);
   assert!(encode.enable_png_webp);
+  assert_eq!(encode.max_webp_pixels, 16_777_216);
   assert!(encode.enable_pdf_predictor);
   assert!(encode.enable_pdf_dct);
   assert!(encode.enable_pdf_ascii);
   assert!(encode.enable_pdf_images);
   assert_eq!(encode.max_pdf_filters, config.max_pdf_filters);
+
+  let custom = FileTransformPrecomp2Config {
+    enable_png_webp: false,
+    max_webp_pixels: 4096,
+    ..Default::default()
+  };
+  let custom_encode = crate::common::precomp2_encode_config(&custom);
+  assert!(!custom_encode.enable_png_webp);
+  assert_eq!(custom_encode.max_webp_pixels, 4096);
 }
 
 #[test]
@@ -552,13 +563,49 @@ fn compressed_zero_bombs_fail_bounded_without_full_decompression() {
     assert!(reader.read_file(recipe_hash).is_err(), "{label} bomb must fail");
   }
 
-  // 4. Even under default 4 GiB precomp2 decode budget, FileReader's
-  //    VerifyingWriter stops
-  // a 4 MiB Lit bomb on the first streamed chunk when recipe.original_file_size
-  // = 64.
+  // 4. Even under default 4 GiB precomp2 decode budget: (a) a 4 MiB Lit bomb
+  //    paired with recipe.original_file_size = 64 is rejected at the PCF2
+  //    header via decode_for_size tightening (2 MiB cap); (b) a 128 KiB Lit
+  //    bomb (within the 2 MiB floor, > 64 bytes) is stopped on the first
+  //    streamed chunk by FileReader's VerifyingWriter.
   let default_cfg = FileTransformConfig::default();
   let default_registry = TransformDecoderRegistry::new(crate::default_decoders(&default_cfg)).unwrap();
-  let stored = crate::common::zstd_compress(&lit_pcf2, 3).unwrap();
+
+  let stored_4m = crate::common::zstd_compress(&lit_pcf2, 3).unwrap();
+  let chunk_hash_4m = Hash32::sha3_256(&stored_4m);
+  let recipe_4m = build_recipe(
+    64,
+    &[(chunk_hash_4m, stored_4m.len() as u32)],
+    Hash32::sha3_256([0u8; 64]),
+    TRANSFORM_ID_PRECOMP2_ZSTD,
+    2,
+  );
+  let recipe_hash_4m = Hash32::sha3_256(&recipe_4m);
+  let source_4m = MemorySource(BTreeMap::from([
+    (
+      chunk_hash_4m,
+      VerifiedObject {
+        hash: chunk_hash_4m,
+        kind: ObjectKind::Chunk,
+        bytes: stored_4m,
+      },
+    ),
+    (
+      recipe_hash_4m,
+      VerifiedObject {
+        hash: recipe_hash_4m,
+        kind: ObjectKind::Recipe,
+        bytes: recipe_4m,
+      },
+    ),
+  ]));
+  let err_4m = FileReader::new(&source_4m, &default_registry, FileReadLimits::default())
+    .read_file(recipe_hash_4m)
+    .unwrap_err();
+  assert!(err_4m.to_string().contains("budget"), "{err_4m:?}");
+
+  let small_lit_pcf2 = precomp2::encode_bytes(&vec![0u8; 128 * 1024], &precomp2::EncodeConfig::default()).unwrap();
+  let stored = crate::common::zstd_compress(&small_lit_pcf2, 3).unwrap();
   let chunk_hash = Hash32::sha3_256(&stored);
   let recipe = build_recipe(
     64,
@@ -590,4 +637,195 @@ fn compressed_zero_bombs_fail_bounded_without_full_decompression() {
     .read_file(recipe_hash)
     .unwrap_err();
   assert!(matches!(err, assetpack_core::Error::OriginalFileMismatch { .. }), "{err:?}");
+}
+
+#[test]
+fn default_specs_enable_quick_check_and_skip_non_matching_inputs() {
+  use assetpack_core::{
+    file_transform::{CandidateOutcome, SelectionReport},
+    pipeline::{DefaultChunkCompressor, Pipeline},
+  };
+
+  let specs = crate::default_specs();
+  assert_eq!(specs.len(), 3);
+  assert!(specs.iter().all(|spec| spec.use_quick_check));
+
+  let config = FileTransformConfig {
+    min_size: 0,
+    min_gain: -10.0,
+    ..Default::default()
+  };
+  let selector = TransformSelector::new(config, None, specs);
+  let pipeline = Pipeline::new(Default::default());
+
+  for (ext, payload) in [
+    (Some("txt"), b"plain text without any container magic header".repeat(16)),
+    (None, vec![0xab; 512]),
+  ] {
+    let hint = FileHint {
+      size: payload.len() as u64,
+      extension: ext.map(str::to_string),
+      head: Some(payload[..8].to_vec()),
+    };
+    let mut report = SelectionReport::default();
+    let selection = selector
+      .select_with_report(
+        payload.clone(),
+        &hint,
+        Hash32::sha3_256(&payload),
+        &pipeline,
+        &DefaultChunkCompressor,
+        &mut report,
+      )
+      .unwrap();
+    assert_eq!(selection.transform_id, TRANSFORM_ID_NONE);
+    assert_eq!(report.candidates.len(), 3);
+    assert!(
+      report.candidates.iter().all(|c| c.outcome == CandidateOutcome::Skipped),
+      "expected all candidates skipped for ext={ext:?}, got {:?}",
+      report.candidates
+    );
+  }
+}
+
+#[test]
+fn fast_preset_bounds_encoding_while_decoding_historical_lzma() {
+  let fast = FileTransformConfig::fast();
+  assert_eq!(fast.max_in_memory_bytes, 32 * 1024 * 1024);
+  assert_eq!(fast.max_transform_bytes, 32 * 1024 * 1024);
+  assert_eq!(fast.eval.max_buffer_bytes, 64 * 1024 * 1024);
+  assert_eq!(fast.precomp2.max_depth, 1);
+  assert_eq!(fast.precomp2.max_total_output, 128 * 1024 * 1024);
+  assert_eq!(fast.precomp2.max_webp_pixels, 8_388_608);
+  assert_eq!(fast.precomp2_zstd.level, 3);
+  assert!(!fast.precomp2_lzma.enabled);
+
+  // Selector under fast() does not consider LZMA.
+  use assetpack_core::{
+    file_transform::SelectionReport,
+    pipeline::{DefaultChunkCompressor, Pipeline},
+  };
+  let mut fast_selector_cfg = fast.clone();
+  fast_selector_cfg.min_size = 0;
+  fast_selector_cfg.min_gain = -10.0;
+  let selector = TransformSelector::new(fast_selector_cfg, None, crate::default_specs());
+  let mut report = SelectionReport::default();
+  let hint = FileHint {
+    size: TINY_PNG.len() as u64,
+    extension: Some("png".into()),
+    head: Some(TINY_PNG[..8].to_vec()),
+  };
+  selector
+    .select_with_report(
+      TINY_PNG.to_vec(),
+      &hint,
+      Hash32::sha3_256(TINY_PNG),
+      &Pipeline::new(Default::default()),
+      &DefaultChunkCompressor,
+      &mut report,
+    )
+    .unwrap();
+  assert!(
+    report.candidates.iter().all(|c| c.transform_id != TRANSFORM_ID_PRECOMP2_LZMA),
+    "fast() must disable LZMA candidate encoding"
+  );
+
+  // Historical LZMA objects still decode cleanly under default_decoders(&fast).
+  let legacy_encoder = crate::Precomp2LzmaTransform::new(&FileTransformConfig::default());
+  let mut stored = Vec::new();
+  legacy_encoder
+    .encode(&mut BufReader::new(Cursor::new(TINY_PNG)), &mut stored)
+    .unwrap();
+  let chunk_hash = Hash32::sha3_256(&stored);
+  let recipe = build_recipe(
+    TINY_PNG.len() as u64,
+    &[(chunk_hash, stored.len() as u32)],
+    Hash32::sha3_256(TINY_PNG),
+    TRANSFORM_ID_PRECOMP2_LZMA,
+    2,
+  );
+  let recipe_hash = Hash32::sha3_256(&recipe);
+  let source = MemorySource(BTreeMap::from([
+    (
+      chunk_hash,
+      VerifiedObject {
+        hash: chunk_hash,
+        kind: ObjectKind::Chunk,
+        bytes: stored,
+      },
+    ),
+    (
+      recipe_hash,
+      VerifiedObject {
+        hash: recipe_hash,
+        kind: ObjectKind::Recipe,
+        bytes: recipe,
+      },
+    ),
+  ]));
+  let fast_registry = TransformDecoderRegistry::new(crate::default_decoders(&fast)).unwrap();
+  assert_eq!(read_file(&source, &fast_registry, recipe_hash), TINY_PNG);
+}
+
+#[test]
+fn default_budget_file_reader_rejects_segbomb_via_decode_for_size() {
+  let default_cfg = FileTransformConfig::default();
+  let dict_size = crate::common::clamp_dict_size(default_cfg.precomp2_lzma.dict_size);
+  let default_registry = TransformDecoderRegistry::new(crate::default_decoders(&default_cfg)).unwrap();
+
+  // Valid PCF2 header claiming original_size = 64, single Dflt segment claiming
+  // data_len = 4 MiB. Under FileTransformConfig::default() (4 GiB global
+  // budget), decode_for_size tightens the per-recipe decode budget to max(64 *
+  // 16, 2 MiB) = 2 MiB, so this fails at the segment header.
+  let mut forged_seg = Vec::new();
+  precomp2::Pcf2Header::new(64).encode(&mut forged_seg).unwrap();
+  forged_seg.push(precomp2::SegmentKind::Dflt as u8);
+  forged_seg.push(0);
+  precomp2::varint::write_varint(64, &mut forged_seg).unwrap();
+  precomp2::varint::write_varint(0, &mut forged_seg).unwrap();
+  precomp2::varint::write_varint(4 << 20, &mut forged_seg).unwrap();
+  forged_seg.resize(forged_seg.len() + (4 << 20), 0);
+
+  let zstd_seg = crate::common::zstd_compress(&forged_seg, 3).unwrap();
+  let lzma_seg = crate::common::lzma_compress(&forged_seg, 1, dict_size).unwrap();
+
+  for (label, transform_id, stored) in [
+    ("zstd-seg-4m-default-budget", TRANSFORM_ID_PRECOMP2_ZSTD, zstd_seg),
+    ("lzma-seg-4m-default-budget", TRANSFORM_ID_PRECOMP2_LZMA, lzma_seg),
+  ] {
+    let chunk_hash = Hash32::sha3_256(&stored);
+    let recipe = build_recipe(
+      64,
+      &[(chunk_hash, stored.len() as u32)],
+      Hash32::sha3_256([0u8; 64]),
+      transform_id,
+      2,
+    );
+    let recipe_hash = Hash32::sha3_256(&recipe);
+    let source = MemorySource(BTreeMap::from([
+      (
+        chunk_hash,
+        VerifiedObject {
+          hash: chunk_hash,
+          kind: ObjectKind::Chunk,
+          bytes: stored,
+        },
+      ),
+      (
+        recipe_hash,
+        VerifiedObject {
+          hash: recipe_hash,
+          kind: ObjectKind::Recipe,
+          bytes: recipe,
+        },
+      ),
+    ]));
+    let err = FileReader::new(&source, &default_registry, FileReadLimits::default())
+      .read_file(recipe_hash)
+      .unwrap_err();
+    assert!(
+      err.to_string().contains("budget") || err.to_string().contains("exceeds"),
+      "{label}: unexpected err: {err:?}"
+    );
+  }
 }

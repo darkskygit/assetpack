@@ -15,8 +15,8 @@ use assetpack_core::{
 };
 use common::{
   TransformGate, clamp_dict_size, lzma_compress, lzma_decode_precomp2, max_mid_stream_bytes, precomp2_decode_config,
-  precomp2_decode_reader, precomp2_encode_bytes, precomp2_encode_config, prepare_precomp2, read_bounded, zstd_compress,
-  zstd_decode_precomp2,
+  precomp2_decode_reader, precomp2_encode_bytes, precomp2_encode_config, prepare_precomp2, read_bounded, tighten_decode_config,
+  zstd_compress, zstd_decode_precomp2,
 };
 use guards::{magic_match, precomp2_guard};
 pub use precomp2::Precomp2Transform;
@@ -53,7 +53,7 @@ pub fn default_specs() -> Vec<TransformSpec> {
       id: TRANSFORM_ID_PRECOMP2,
       name: "precomp2",
       selectable: true,
-      use_quick_check: false,
+      use_quick_check: true,
       enabled: precomp2_enabled,
       build: build_precomp2,
     },
@@ -61,7 +61,7 @@ pub fn default_specs() -> Vec<TransformSpec> {
       id: TRANSFORM_ID_PRECOMP2_ZSTD,
       name: "precomp2-zstd",
       selectable: true,
-      use_quick_check: false,
+      use_quick_check: true,
       enabled: precomp2_zstd_enabled,
       build: build_precomp2_zstd,
     },
@@ -69,7 +69,7 @@ pub fn default_specs() -> Vec<TransformSpec> {
       id: TRANSFORM_ID_PRECOMP2_LZMA,
       name: "precomp2-lzma",
       selectable: true,
-      use_quick_check: false,
+      use_quick_check: true,
       enabled: precomp2_lzma_enabled,
       build: build_precomp2_lzma,
     },
@@ -105,5 +105,13 @@ impl TransformDecoder for LegacyDecoder {
   }
   fn decode(&self, input: &mut dyn std::io::BufRead, out: &mut dyn std::io::Write) -> assetpack_core::Result<()> {
     self.0.decode(input, out)
+  }
+  fn decode_for_size(
+    &self,
+    input: &mut dyn std::io::BufRead,
+    out: &mut dyn std::io::Write,
+    original_file_size: u64,
+  ) -> assetpack_core::Result<()> {
+    self.0.decode_for_size(input, out, original_file_size)
   }
 }

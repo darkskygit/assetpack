@@ -15,6 +15,13 @@ pub trait TransformDecoder: Send + Sync {
   fn id(&self) -> u16;
   fn version(&self) -> u16;
   fn decode(&self, input: &mut dyn io::BufRead, output: &mut dyn io::Write) -> Result<()>;
+
+  /// Decodes a stored stream whose recipe declares `original_file_size` bytes.
+  /// Decoders may tighten internal intermediate-buffer budgets relative to the
+  /// declared output size without rebuilding the registry.
+  fn decode_for_size(&self, input: &mut dyn io::BufRead, output: &mut dyn io::Write, _original_file_size: u64) -> Result<()> {
+    self.decode(input, output)
+  }
 }
 
 struct NoneDecoder;

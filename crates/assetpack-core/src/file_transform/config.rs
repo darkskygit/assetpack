@@ -46,6 +46,35 @@ impl Default for FileTransformConfig {
 }
 
 impl FileTransformConfig {
+  /// Bounded preset for online object-storage services. Disables the pure-Rust
+  /// LZMA encoder (decoders remain registered for historical objects), bounds
+  /// transform input/memory sizes, and caps lossless WebP reencoding at 8 MP.
+  pub fn fast() -> Self {
+    Self {
+      max_in_memory_bytes: 32 * 1024 * 1024,
+      max_transform_bytes: 32 * 1024 * 1024,
+      eval: FileTransformEvalConfig {
+        max_buffer_bytes: 64 * 1024 * 1024,
+        ..FileTransformEvalConfig::default()
+      },
+      precomp2: FileTransformPrecomp2Config {
+        max_depth: 1,
+        max_total_output: 128 * 1024 * 1024,
+        max_webp_pixels: 8_388_608,
+        ..FileTransformPrecomp2Config::default()
+      },
+      precomp2_zstd: FileTransformPrecomp2ZstdConfig {
+        level: 3,
+        ..FileTransformPrecomp2ZstdConfig::default()
+      },
+      precomp2_lzma: FileTransformPrecomp2LzmaConfig {
+        enabled: false,
+        ..FileTransformPrecomp2LzmaConfig::default()
+      },
+      ..Self::default()
+    }
+  }
+
   pub fn resolved_temp_dir(&self, root: &Path) -> Option<PathBuf> {
     let dir = self.temp_dir.as_ref()?;
     if dir.as_os_str().is_empty() {
@@ -83,6 +112,8 @@ pub struct FileTransformPrecomp2Config {
   pub max_expand_ratio: f64,
   pub max_total_output: u64,
   pub recover: bool,
+  pub enable_png_webp: bool,
+  pub max_webp_pixels: u64,
   pub enable_pdf_dct: bool,
   pub enable_pdf_ascii: bool,
   pub enable_pdf_predictor: bool,
@@ -98,6 +129,8 @@ impl Default for FileTransformPrecomp2Config {
       max_expand_ratio: 16.0,
       max_total_output: 1 << 32,
       recover: false,
+      enable_png_webp: true,
+      max_webp_pixels: 16_777_216,
       enable_pdf_dct: true,
       enable_pdf_ascii: true,
       enable_pdf_predictor: true,

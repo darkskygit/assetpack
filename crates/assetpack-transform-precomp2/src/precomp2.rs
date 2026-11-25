@@ -7,7 +7,7 @@ use assetpack_core::{
 
 use super::{
   TransformGate, max_mid_stream_bytes, precomp2_decode_config, precomp2_decode_reader, precomp2_encode_bytes, precomp2_encode_config,
-  read_bounded,
+  read_bounded, tighten_decode_config,
 };
 
 #[derive(Debug, Clone)]
@@ -40,6 +40,11 @@ impl TransformDecoder for Precomp2Transform {
 
   fn decode(&self, input: &mut dyn BufRead, out: &mut dyn Write) -> assetpack_core::Result<()> {
     precomp2_decode_reader(input, out, &self.decode_config, self.max_mid_bytes)
+  }
+
+  fn decode_for_size(&self, input: &mut dyn BufRead, out: &mut dyn Write, original_file_size: u64) -> assetpack_core::Result<()> {
+    let (decode_config, max_mid_bytes) = tighten_decode_config(&self.decode_config, self.max_mid_bytes, original_file_size);
+    precomp2_decode_reader(input, out, &decode_config, max_mid_bytes)
   }
 }
 

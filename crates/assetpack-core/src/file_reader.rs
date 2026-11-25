@@ -55,14 +55,12 @@ impl<'a, S: crate::ObjectSource + ?Sized> FileReader<'a, S> {
 
   pub fn restore_file(&self, recipe_hash: Hash32, output: &mut dyn Write) -> Result<()> {
     let recipe = self.load_recipe(recipe_hash)?;
-    let stored = self.read_stored_for_recipe(&recipe)?;
-    decode_recipe(self.decoders, &recipe, stored, output)
+    decode_recipe_streaming(self.decoders, self.source, &recipe, output)
   }
 
   pub fn read_file(&self, recipe_hash: Hash32) -> Result<Vec<u8>> {
     let recipe = self.load_recipe(recipe_hash)?;
-    let stored = self.read_stored_for_recipe(&recipe)?;
-    read_decoded_file(self.decoders, &recipe, stored)
+    read_decoded_file_streaming(self.decoders, self.source, &recipe)
   }
 
   fn load_recipe(&self, recipe_hash: Hash32) -> Result<RecipeData> {
@@ -195,6 +193,166 @@ fn check_limit(limit: &'static str, maximum: u64, actual: u64) -> Result<()> {
   Ok(())
 }
 
+fn read_decoded_file_streaming<S: crate::ObjectSource + ?Sized>(
+  decoders: &TransformDecoderRegistry,
+  source: &S,
+  recipe: &RecipeData,
+) -> Result<Vec<u8>> {
+  let mut output = FallibleVecWriter::default();
+  let result = decode_recipe_streaming(decoders, source, recipe, &mut output);
+  if let Some(requested) = output.allocation_failure {
+    return Err(Error::FileReadAllocationFailed {
+      buffer: "original file",
+      requested,
+    });
+  }
+  result?;
+  Ok(output.bytes)
+}
+
+fn decode_recipe_streaming<S: crate::ObjectSource + ?Sized>(
+  decoders: &TransformDecoderRegistry,
+  source: &S,
+  recipe: &RecipeData,
+  output: &mut dyn Write,
+) -> Result<()> {
+  let decoder = decoders.get(recipe.transform_id, recipe.transform_version)?;
+  let mut input = BufReader::new(ChunkStreamReader::new(source, &recipe.chunks, recipe.stored_stream_size));
+  let mut verified = VerifyingWriter::new(output, recipe.original_file_size);
+  let result = decoder.decode_for_size(&mut input, &mut verified, recipe.original_file_size);
+  let unread_buffered = input.buffer().len() as u64;
+  let mut stream = input.into_inner();
+  if let Some(err) = stream.take_error() {
+    return Err(err);
+  }
+  if verified.exceeded {
+    return Err(original_mismatch(recipe, &verified));
+  }
+  result?;
+  stream.finish_validating(unread_buffered)?;
+  let actual_hash = verified.hash();
+  if verified.written != recipe.original_file_size || actual_hash != recipe.original_file_hash {
+    return Err(Error::OriginalFileMismatch {
+      expected_size: recipe.original_file_size,
+      actual_size: verified.written,
+      expected_hash: recipe.original_file_hash,
+      actual_hash,
+    });
+  }
+  Ok(())
+}
+
+struct ChunkStreamReader<'a, S: crate::ObjectSource + ?Sized> {
+  source: &'a S,
+  chunks: &'a [(Hash32, u32)],
+  next_index: usize,
+  current: Vec<u8>,
+  cursor: usize,
+  expected_total: u64,
+  read_total: u64,
+  error: Option<Error>,
+}
+
+impl<'a, S: crate::ObjectSource + ?Sized> ChunkStreamReader<'a, S> {
+  fn new(source: &'a S, chunks: &'a [(Hash32, u32)], expected_total: u64) -> Self {
+    Self {
+      source,
+      chunks,
+      next_index: 0,
+      current: Vec::new(),
+      cursor: 0,
+      expected_total,
+      read_total: 0,
+      error: None,
+    }
+  }
+
+  fn take_error(&mut self) -> Option<Error> {
+    self.error.take()
+  }
+
+  fn fetch_next_chunk(&mut self) -> Result<Option<Vec<u8>>> {
+    let Some(&(hash, expected_len)) = self.chunks.get(self.next_index) else {
+      return Ok(None);
+    };
+    self.next_index += 1;
+    let object = self.source.read_object(&hash)?.ok_or(Error::ObjectNotFound)?;
+    validate_chunk(&object.hash, object.kind, object.bytes.len() as u64, u64::from(expected_len))?;
+    Ok(Some(object.bytes))
+  }
+
+  fn finish_validating(mut self, unread_buffered: u64) -> Result<()> {
+    if let Some(err) = self.error.take() {
+      return Err(err);
+    }
+    let mut total = self
+      .read_total
+      .checked_add((self.current.len() - self.cursor) as u64)
+      .ok_or_else(|| Error::InvalidRecipe("stored stream size overflow".to_string()))?;
+    // `BufReader::buffer()` holds bytes already counted in `self.read_total`;
+    // only check that we didn't somehow account for fewer bytes than buffered.
+    if unread_buffered > self.read_total {
+      return Err(Error::InvalidRecipe("stored stream read accounting mismatch".to_string()));
+    }
+    self.current = Vec::new();
+    self.cursor = 0;
+    while let Some(bytes) = self.fetch_next_chunk()? {
+      total = total
+        .checked_add(bytes.len() as u64)
+        .ok_or_else(|| Error::InvalidRecipe("stored stream size overflow".to_string()))?;
+    }
+    if total != self.expected_total {
+      return Err(Error::InvalidRecipe(format!(
+        "stored stream size mismatch: expected {}, got {total}",
+        self.expected_total
+      )));
+    }
+    Ok(())
+  }
+}
+
+impl<S: crate::ObjectSource + ?Sized> io::Read for ChunkStreamReader<'_, S> {
+  fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+    if buf.is_empty() {
+      return Ok(0);
+    }
+    while self.cursor >= self.current.len() {
+      match self.fetch_next_chunk() {
+        Ok(Some(bytes)) => {
+          self.current = bytes;
+          self.cursor = 0;
+        }
+        Ok(None) => {
+          self.current = Vec::new();
+          self.cursor = 0;
+          if self.read_total != self.expected_total {
+            self.error = Some(Error::InvalidRecipe(format!(
+              "stored stream size mismatch: expected {}, got {}",
+              self.expected_total, self.read_total
+            )));
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "stored stream size mismatch"));
+          }
+          return Ok(0);
+        }
+        Err(err) => {
+          self.error = Some(err);
+          return Err(io::Error::other("chunk read failed"));
+        }
+      }
+    }
+    let available = self.current.len() - self.cursor;
+    let to_copy = available.min(buf.len());
+    buf[..to_copy].copy_from_slice(&self.current[self.cursor..self.cursor + to_copy]);
+    self.cursor += to_copy;
+    self.read_total += to_copy as u64;
+    if self.cursor == self.current.len() {
+      self.current = Vec::new();
+      self.cursor = 0;
+    }
+    Ok(to_copy)
+  }
+}
+
 fn read_decoded_file(decoders: &TransformDecoderRegistry, recipe: &RecipeData, stored: Vec<u8>) -> Result<Vec<u8>> {
   let mut output = FallibleVecWriter::default();
   let result = decode_recipe(decoders, recipe, stored, &mut output);
@@ -212,7 +370,7 @@ fn decode_recipe(decoders: &TransformDecoderRegistry, recipe: &RecipeData, store
   let decoder = decoders.get(recipe.transform_id, recipe.transform_version)?;
   let mut input = BufReader::new(Cursor::new(stored));
   let mut verified = VerifyingWriter::new(output, recipe.original_file_size);
-  let result = decoder.decode(&mut input, &mut verified);
+  let result = decoder.decode_for_size(&mut input, &mut verified, recipe.original_file_size);
   if verified.exceeded {
     return Err(original_mismatch(recipe, &verified));
   }
@@ -328,6 +486,12 @@ mod tests {
 
   #[derive(Default)]
   struct MemorySource(BTreeMap<Hash32, VerifiedObject>);
+
+  impl crate::ObjectSource for MemorySource {
+    fn read_object(&self, hash: &Hash32) -> Result<Option<VerifiedObject>> {
+      Ok(self.0.get(hash).cloned())
+    }
+  }
 
   impl AsyncObjectSource for MemorySource {
     async fn read_object(&self, hash: &Hash32) -> Result<Option<VerifiedObject>> {
@@ -645,5 +809,99 @@ mod tests {
     }
     let registry = TransformDecoderRegistry::new([Arc::new(Decoder) as Arc<dyn crate::TransformDecoder>]).unwrap();
     assert_eq!(registry.get(91, 2).unwrap().version(), 2);
+  }
+
+  #[tokio::test]
+  async fn sync_streaming_file_reader_handles_multi_chunk_errors_and_decode_for_size() {
+    use std::sync::atomic::AtomicU64;
+
+    struct SizeRecordingDecoder {
+      seen_size: Arc<AtomicU64>,
+      stop_after: Option<usize>,
+    }
+    impl crate::TransformDecoder for SizeRecordingDecoder {
+      fn id(&self) -> u16 {
+        92
+      }
+      fn version(&self) -> u16 {
+        1
+      }
+      fn decode(&self, _input: &mut dyn io::BufRead, _output: &mut dyn Write) -> Result<()> {
+        panic!("FileReader/AsyncFileReader must call decode_for_size");
+      }
+      fn decode_for_size(&self, input: &mut dyn io::BufRead, output: &mut dyn Write, original_file_size: u64) -> Result<()> {
+        self.seen_size.store(original_file_size, Ordering::Relaxed);
+        if let Some(limit) = self.stop_after {
+          let mut buf = vec![0u8; limit];
+          input.read_exact(&mut buf)?;
+          output.write_all(&buf)?;
+        } else {
+          io::copy(input, output)?;
+        }
+        Ok(())
+      }
+    }
+
+    let seen_size = Arc::new(AtomicU64::new(0));
+    let registry = TransformDecoderRegistry::new([Arc::new(SizeRecordingDecoder {
+      seen_size: seen_size.clone(),
+      stop_after: None,
+    }) as Arc<dyn crate::TransformDecoder>])
+    .unwrap();
+
+    for (chunks, order) in [
+      (vec![], vec![]),
+      (vec![b"alpha".as_slice()], vec![0]),
+      (vec![b"alpha".as_slice(), b"beta".as_slice(), b"gamma".as_slice()], vec![0, 1, 2]),
+      (vec![b"alpha".as_slice(), b"beta".as_slice()], vec![0, 1, 0]),
+    ] {
+      let expected = order.iter().flat_map(|index| chunks[*index]).copied().collect::<Vec<_>>();
+      let (source, recipe_hash) = source_for(&chunks, &order, expected.len() as u64, Hash32::sha3_256(&expected), (92, 1));
+      let sync_reader = FileReader::new(&source, &registry, FileReadLimits::default());
+      assert_eq!(sync_reader.read_file(recipe_hash).unwrap(), expected);
+      assert_eq!(seen_size.load(Ordering::Relaxed), expected.len() as u64);
+
+      let mut restored = Vec::new();
+      sync_reader.restore_file(recipe_hash, &mut restored).unwrap();
+      assert_eq!(restored, expected);
+
+      seen_size.store(u64::MAX, Ordering::Relaxed);
+      let async_reader = AsyncFileReader::new(&source, &registry, FileReadLimits::default());
+      assert_eq!(async_reader.read_file(recipe_hash).await.unwrap(), expected);
+      assert_eq!(seen_size.load(Ordering::Relaxed), expected.len() as u64);
+    }
+
+    // Even when a decoder stops reading after chunk 0, sync FileReader still
+    // validates trailing chunks and preserves structured errors
+    // (ObjectNotFound, ObjectKindMismatch, RecipeChunkLengthMismatch).
+    let early_registry = TransformDecoderRegistry::new([Arc::new(SizeRecordingDecoder {
+      seen_size: seen_size.clone(),
+      stop_after: Some(5),
+    }) as Arc<dyn crate::TransformDecoder>])
+    .unwrap();
+    let chunks = [b"alpha".as_slice(), b"extra".as_slice()];
+    let (base_source, recipe_hash) = source_for(&chunks, &[0, 1], 5, Hash32::sha3_256(b"alpha"), (92, 1));
+    let trailing_hash = parse_recipe(&base_source.0[&recipe_hash].bytes).unwrap().chunks[1].0;
+
+    let mut missing_trailing = MemorySource(base_source.0.clone());
+    missing_trailing.0.remove(&trailing_hash);
+    assert!(matches!(
+      FileReader::new(&missing_trailing, &early_registry, FileReadLimits::default()).read_file(recipe_hash),
+      Err(Error::ObjectNotFound)
+    ));
+
+    let mut wrong_kind = MemorySource(base_source.0.clone());
+    wrong_kind.0.get_mut(&trailing_hash).unwrap().kind = ObjectKind::Recipe;
+    assert!(matches!(
+      FileReader::new(&wrong_kind, &early_registry, FileReadLimits::default()).read_file(recipe_hash),
+      Err(Error::ObjectKindMismatch { .. })
+    ));
+
+    let mut wrong_len = MemorySource(base_source.0.clone());
+    wrong_len.0.get_mut(&trailing_hash).unwrap().bytes.push(0);
+    assert!(matches!(
+      FileReader::new(&wrong_len, &early_registry, FileReadLimits::default()).read_file(recipe_hash),
+      Err(Error::RecipeChunkLengthMismatch { .. })
+    ));
   }
 }
