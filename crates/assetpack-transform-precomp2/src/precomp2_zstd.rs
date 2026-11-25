@@ -6,8 +6,8 @@ use assetpack_core::{
 };
 
 use super::{
-  TransformGate, precomp2_decode_bytes, precomp2_decode_config, precomp2_encode_bytes, precomp2_encode_config, read_all, zstd_compress,
-  zstd_decompress,
+  TransformGate, max_mid_stream_bytes, precomp2_decode_config, precomp2_encode_bytes, precomp2_encode_config, read_bounded, zstd_compress,
+  zstd_decode_precomp2,
 };
 
 #[derive(Debug, Clone)]
@@ -15,6 +15,7 @@ pub struct Precomp2ZstdTransform {
   gate: TransformGate,
   encode_config: precomp2::EncodeConfig,
   decode_config: precomp2::DecodeConfig,
+  max_mid_bytes: u64,
   level: i32,
 }
 
@@ -24,6 +25,7 @@ impl Precomp2ZstdTransform {
       gate: TransformGate::new(config),
       encode_config: precomp2_encode_config(&config.precomp2),
       decode_config: precomp2_decode_config(&config.precomp2),
+      max_mid_bytes: max_mid_stream_bytes(config),
       level: config.precomp2_zstd.level,
     }
   }
@@ -39,11 +41,7 @@ impl TransformDecoder for Precomp2ZstdTransform {
   }
 
   fn decode(&self, input: &mut dyn BufRead, out: &mut dyn Write) -> assetpack_core::Result<()> {
-    let encoded = read_all(input)?;
-    let decoded = zstd_decompress(&encoded)?;
-    let output = precomp2_decode_bytes(&decoded, &self.decode_config)?;
-    out.write_all(&output)?;
-    Ok(())
+    zstd_decode_precomp2(input, out, &self.decode_config, self.max_mid_bytes)
   }
 }
 
@@ -68,7 +66,7 @@ impl FileTransform for Precomp2ZstdTransform {
   }
 
   fn encode(&self, input: &mut dyn BufRead, out: &mut dyn Write) -> assetpack_core::Result<TransformStats> {
-    let input_bytes = read_all(input)?;
+    let input_bytes = read_bounded(input, self.gate.max_size(), "precomp2-zstd encode")?;
     let input_len = input_bytes.len() as u64;
     let encoded = precomp2_encode_bytes(&input_bytes, &self.encode_config)?;
     let compressed = zstd_compress(&encoded, self.level)?;

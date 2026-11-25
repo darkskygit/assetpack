@@ -438,3 +438,156 @@ fn unityfs_magic_selects_precomp2_and_roundtrips() {
     "bundle block should be converted to a UnityFs segment"
   );
 }
+
+#[test]
+fn malformed_six_byte_input_returns_err_across_all_precomp2_decoders() {
+  let bad_precomp: &[u8] = b"\x00\x05\x00\x00\x00\x00";
+  let config = FileTransformConfig::default();
+  let dict_size = crate::common::clamp_dict_size(config.precomp2_lzma.dict_size);
+  let bad_zstd = crate::common::zstd_compress(bad_precomp, 1).unwrap();
+  let bad_lzma = crate::common::lzma_compress(bad_precomp, 1, dict_size).unwrap();
+
+  let precomp2 = crate::Precomp2Transform::new(&config);
+  let precomp2_zstd = crate::Precomp2ZstdTransform::new(&config);
+  let precomp2_lzma = crate::Precomp2LzmaTransform::new(&config);
+
+  for (label, decoder, payload) in [
+    ("raw-precomp2", &precomp2 as &dyn assetpack_core::TransformDecoder, bad_precomp),
+    ("raw-zstd", &precomp2_zstd as &dyn assetpack_core::TransformDecoder, bad_precomp),
+    (
+      "wrapped-zstd",
+      &precomp2_zstd as &dyn assetpack_core::TransformDecoder,
+      bad_zstd.as_slice(),
+    ),
+    ("raw-lzma", &precomp2_lzma as &dyn assetpack_core::TransformDecoder, bad_precomp),
+    (
+      "wrapped-lzma",
+      &precomp2_lzma as &dyn assetpack_core::TransformDecoder,
+      bad_lzma.as_slice(),
+    ),
+  ] {
+    let mut out = Vec::new();
+    let err = decoder.decode(&mut BufReader::new(Cursor::new(payload)), &mut out);
+    assert!(err.is_err(), "{label} must return Err, not panic or succeed");
+  }
+}
+
+#[test]
+fn compressed_zero_bombs_fail_bounded_without_full_decompression() {
+  let config = FileTransformConfig {
+    precomp2: FileTransformPrecomp2Config {
+      max_total_output: 64 * 1024,
+      ..Default::default()
+    },
+    ..Default::default()
+  };
+  let dict_size = crate::common::clamp_dict_size(config.precomp2_lzma.dict_size);
+  let registry = TransformDecoderRegistry::new(crate::default_decoders(&config)).unwrap();
+
+  // 1. 4 MiB all-zero zstd & lzma bombs claiming original_file_size = 64 fail
+  //    cleanly on magic check.
+  let raw_zeros = vec![0u8; 4 << 20];
+  let zstd_zero_bomb = crate::common::zstd_compress(&raw_zeros, 3).unwrap();
+  let lzma_zero_bomb = crate::common::lzma_compress(&raw_zeros, 1, dict_size).unwrap();
+  assert!(zstd_zero_bomb.len() < 4096);
+  assert!(lzma_zero_bomb.len() < 4096);
+
+  // 2. 4 MiB valid PCF2 Lit container claiming 4 MiB wrapped in zstd & lzma,
+  //    paired with a
+  // recipe claiming original_file_size = 64 -> VerifyingWriter / decode budget
+  // stops immediately.
+  let lit_pcf2 = precomp2::encode_bytes(&raw_zeros, &precomp2::EncodeConfig::default()).unwrap();
+  let zstd_lit_bomb = crate::common::zstd_compress(&lit_pcf2, 3).unwrap();
+  let lzma_lit_bomb = crate::common::lzma_compress(&lit_pcf2, 1, dict_size).unwrap();
+
+  // 3. Valid PCF2 header claiming original_size = 64, Dflt segment claiming
+  //    data_len = 2 MiB of zeros.
+  let mut forged_seg = Vec::new();
+  precomp2::Pcf2Header::new(64).encode(&mut forged_seg).unwrap();
+  forged_seg.push(precomp2::SegmentKind::Dflt as u8);
+  forged_seg.push(0);
+  precomp2::varint::write_varint(64, &mut forged_seg).unwrap();
+  precomp2::varint::write_varint(0, &mut forged_seg).unwrap();
+  precomp2::varint::write_varint(2 << 20, &mut forged_seg).unwrap();
+  forged_seg.resize(forged_seg.len() + (2 << 20), 0);
+  let zstd_seg_bomb = crate::common::zstd_compress(&forged_seg, 3).unwrap();
+  let lzma_seg_bomb = crate::common::lzma_compress(&forged_seg, 1, dict_size).unwrap();
+
+  for (label, transform_id, stored) in [
+    ("zstd-zeros", TRANSFORM_ID_PRECOMP2_ZSTD, zstd_zero_bomb),
+    ("lzma-zeros", TRANSFORM_ID_PRECOMP2_LZMA, lzma_zero_bomb),
+    ("zstd-lit-4m", TRANSFORM_ID_PRECOMP2_ZSTD, zstd_lit_bomb),
+    ("lzma-lit-4m", TRANSFORM_ID_PRECOMP2_LZMA, lzma_lit_bomb),
+    ("zstd-seg-2m", TRANSFORM_ID_PRECOMP2_ZSTD, zstd_seg_bomb),
+    ("lzma-seg-2m", TRANSFORM_ID_PRECOMP2_LZMA, lzma_seg_bomb),
+  ] {
+    let chunk_hash = Hash32::sha3_256(&stored);
+    let recipe = build_recipe(
+      64,
+      &[(chunk_hash, stored.len() as u32)],
+      Hash32::sha3_256([0u8; 64]),
+      transform_id,
+      2,
+    );
+    let recipe_hash = Hash32::sha3_256(&recipe);
+    let source = MemorySource(BTreeMap::from([
+      (
+        chunk_hash,
+        VerifiedObject {
+          hash: chunk_hash,
+          kind: ObjectKind::Chunk,
+          bytes: stored,
+        },
+      ),
+      (
+        recipe_hash,
+        VerifiedObject {
+          hash: recipe_hash,
+          kind: ObjectKind::Recipe,
+          bytes: recipe,
+        },
+      ),
+    ]));
+    let reader = FileReader::new(&source, &registry, FileReadLimits::default());
+    assert!(reader.read_file(recipe_hash).is_err(), "{label} bomb must fail");
+  }
+
+  // 4. Even under default 4 GiB precomp2 decode budget, FileReader's
+  //    VerifyingWriter stops
+  // a 4 MiB Lit bomb on the first streamed chunk when recipe.original_file_size
+  // = 64.
+  let default_cfg = FileTransformConfig::default();
+  let default_registry = TransformDecoderRegistry::new(crate::default_decoders(&default_cfg)).unwrap();
+  let stored = crate::common::zstd_compress(&lit_pcf2, 3).unwrap();
+  let chunk_hash = Hash32::sha3_256(&stored);
+  let recipe = build_recipe(
+    64,
+    &[(chunk_hash, stored.len() as u32)],
+    Hash32::sha3_256([0u8; 64]),
+    TRANSFORM_ID_PRECOMP2_ZSTD,
+    2,
+  );
+  let recipe_hash = Hash32::sha3_256(&recipe);
+  let source = MemorySource(BTreeMap::from([
+    (
+      chunk_hash,
+      VerifiedObject {
+        hash: chunk_hash,
+        kind: ObjectKind::Chunk,
+        bytes: stored,
+      },
+    ),
+    (
+      recipe_hash,
+      VerifiedObject {
+        hash: recipe_hash,
+        kind: ObjectKind::Recipe,
+        bytes: recipe,
+      },
+    ),
+  ]));
+  let err = FileReader::new(&source, &default_registry, FileReadLimits::default())
+    .read_file(recipe_hash)
+    .unwrap_err();
+  assert!(matches!(err, assetpack_core::Error::OriginalFileMismatch { .. }), "{err:?}");
+}

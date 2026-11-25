@@ -1,6 +1,6 @@
 use std::{
   collections::HashSet,
-  io::{BufRead, Cursor, Read, Write},
+  io::{self, BufRead, Cursor, Read, Write},
 };
 
 use assetpack_core::{
@@ -11,6 +11,11 @@ use lzma_rust2::{DICT_SIZE_MAX, DICT_SIZE_MIN, Lzma2Options, Lzma2Reader, Lzma2W
 use precomp2::{DecodeConfig as Precomp2DecodeConfig, EncodeConfig as Precomp2EncodeConfig};
 
 use super::{magic_match, precomp2_guard};
+
+/// Small framing slack above `max_total_output` so tiny valid files (such as a
+/// 68-byte PNG whose PCF2 wrapper is ~143 bytes) still stream cleanly under an
+/// exact output budget.
+const MID_STREAM_SLACK_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Clone)]
 pub(crate) struct TransformGate {
@@ -27,6 +32,10 @@ impl TransformGate {
       min_size: config.min_size,
       max_size: config.max_transform_bytes,
     }
+  }
+
+  pub(crate) fn max_size(&self) -> u64 {
+    self.max_size
   }
 
   pub(crate) fn quick_check(&self, hint: &FileHint) -> bool {
@@ -48,10 +57,64 @@ impl TransformGate {
   }
 }
 
-pub(crate) fn read_all(input: &mut dyn BufRead) -> Result<Vec<u8>> {
+pub(crate) fn max_mid_stream_bytes(config: &FileTransformConfig) -> u64 {
+  config.precomp2.max_total_output.saturating_add(MID_STREAM_SLACK_BYTES)
+}
+
+pub(crate) fn read_bounded(input: &mut dyn BufRead, max_bytes: u64, label: &'static str) -> Result<Vec<u8>> {
   let mut data = Vec::new();
-  input.read_to_end(&mut data)?;
+  input.take(max_bytes.saturating_add(1)).read_to_end(&mut data)?;
+  if data.len() as u64 > max_bytes {
+    return Err(Error::Other(format!("{label} input exceeds limit ({max_bytes} bytes)")));
+  }
   Ok(data)
+}
+
+struct BoundedReader<R> {
+  inner: R,
+  limit: u64,
+  read: u64,
+  exceeded: bool,
+}
+
+impl<R> BoundedReader<R> {
+  fn new(inner: R, limit: u64) -> Self {
+    Self {
+      inner,
+      limit,
+      read: 0,
+      exceeded: false,
+    }
+  }
+
+  fn is_exceeded(&self) -> bool {
+    self.exceeded
+  }
+}
+
+impl<R: Read> Read for BoundedReader<R> {
+  fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+    if buf.is_empty() {
+      return Ok(0);
+    }
+    let remaining = self.limit.saturating_sub(self.read);
+    if remaining == 0 {
+      let mut probe = [0u8; 1];
+      let n = self.inner.read(&mut probe)?;
+      if n > 0 {
+        self.exceeded = true;
+        return Err(io::Error::new(
+          io::ErrorKind::FileTooLarge,
+          "precomp2 intermediate stream exceeds budget",
+        ));
+      }
+      return Ok(0);
+    }
+    let max_read = (buf.len() as u64).min(remaining) as usize;
+    let n = self.inner.read(&mut buf[..max_read])?;
+    self.read = self.read.saturating_add(n as u64);
+    Ok(n)
+  }
 }
 
 pub(crate) fn precomp2_encode_config(config: &FileTransformPrecomp2Config) -> Precomp2EncodeConfig {
@@ -88,16 +151,46 @@ pub(crate) fn prepare_precomp2<'a>(
   context.get_or_prepare(format!("precomp2-v2:{config:?}"), || precomp2_encode_bytes(input, config))
 }
 
-pub(crate) fn precomp2_decode_bytes(encoded: &[u8], config: &Precomp2DecodeConfig) -> Result<Vec<u8>> {
-  precomp2_guard("decode", precomp2::decode_bytes(encoded, config))
+pub(crate) fn precomp2_decode_reader<R: Read>(
+  reader: R,
+  out: &mut dyn Write,
+  config: &Precomp2DecodeConfig,
+  max_mid_bytes: u64,
+) -> Result<()> {
+  if config.recover {
+    let mut encoded = Vec::new();
+    reader
+      .take(max_mid_bytes.saturating_add(1))
+      .read_to_end(&mut encoded)
+      .map_err(|e| Error::Decompress(e.to_string()))?;
+    if encoded.len() as u64 > max_mid_bytes {
+      return Err(Error::Decompress("precomp2 intermediate stream exceeds budget".to_string()));
+    }
+    let decoded = precomp2_guard("decode", precomp2::decode_bytes(&encoded, config))?;
+    out.write_all(&decoded)?;
+    return Ok(());
+  }
+
+  let mut bounded = BoundedReader::new(reader, max_mid_bytes);
+  match precomp2::decode_reader(&mut bounded, out, config) {
+    Ok(_) => Ok(()),
+    Err(_) if bounded.is_exceeded() => Err(Error::Decompress("precomp2 intermediate stream exceeds budget".to_string())),
+    Err(err) => precomp2_guard("decode", Err(err)),
+  }
 }
 
 pub(crate) fn zstd_compress(input: &[u8], level: i32) -> Result<Vec<u8>> {
   zstd::encode_all(Cursor::new(input), level).map_err(|e| Error::Compress(e.to_string()))
 }
 
-pub(crate) fn zstd_decompress(input: &[u8]) -> Result<Vec<u8>> {
-  zstd::decode_all(Cursor::new(input)).map_err(|e| Error::Decompress(e.to_string()))
+pub(crate) fn zstd_decode_precomp2(
+  input: &mut dyn BufRead,
+  out: &mut dyn Write,
+  config: &Precomp2DecodeConfig,
+  max_mid_bytes: u64,
+) -> Result<()> {
+  let decoder = zstd::stream::read::Decoder::with_buffer(input).map_err(|e| Error::Decompress(e.to_string()))?;
+  precomp2_decode_reader(decoder, out, config, max_mid_bytes)
 }
 
 pub(crate) fn clamp_dict_size(value: usize) -> u32 {
@@ -117,9 +210,13 @@ pub(crate) fn lzma_compress(input: &[u8], preset: u32, dict_size: u32) -> Result
   Ok(compressed)
 }
 
-pub(crate) fn lzma_decompress(input: &[u8], dict_size: u32) -> Result<Vec<u8>> {
-  let mut reader = Lzma2Reader::new(Cursor::new(input), dict_size, None);
-  let mut decoded = Vec::new();
-  reader.read_to_end(&mut decoded).map_err(|e| Error::Decompress(e.to_string()))?;
-  Ok(decoded)
+pub(crate) fn lzma_decode_precomp2(
+  input: &mut dyn BufRead,
+  out: &mut dyn Write,
+  dict_size: u32,
+  config: &Precomp2DecodeConfig,
+  max_mid_bytes: u64,
+) -> Result<()> {
+  let reader = Lzma2Reader::new(input, dict_size, None);
+  precomp2_decode_reader(reader, out, config, max_mid_bytes)
 }

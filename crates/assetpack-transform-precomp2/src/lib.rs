@@ -14,8 +14,9 @@ use assetpack_core::{
   file_transform::{FileTransform, FileTransformConfig, TransformSpec},
 };
 use common::{
-  TransformGate, clamp_dict_size, lzma_compress, lzma_decompress, precomp2_decode_bytes, precomp2_decode_config, precomp2_encode_bytes,
-  precomp2_encode_config, prepare_precomp2, read_all, zstd_compress, zstd_decompress,
+  TransformGate, clamp_dict_size, lzma_compress, lzma_decode_precomp2, max_mid_stream_bytes, precomp2_decode_config,
+  precomp2_decode_reader, precomp2_encode_bytes, precomp2_encode_config, prepare_precomp2, read_bounded, zstd_compress,
+  zstd_decode_precomp2,
 };
 use guards::{magic_match, precomp2_guard};
 pub use precomp2::Precomp2Transform;

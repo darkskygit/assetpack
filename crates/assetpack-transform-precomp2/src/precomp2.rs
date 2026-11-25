@@ -5,13 +5,17 @@ use assetpack_core::{
   file_transform::{FileHint, FileTransform, FileTransformConfig, TransformEncodeContext, TransformStats},
 };
 
-use super::{TransformGate, precomp2_decode_bytes, precomp2_decode_config, precomp2_encode_bytes, precomp2_encode_config, read_all};
+use super::{
+  TransformGate, max_mid_stream_bytes, precomp2_decode_config, precomp2_decode_reader, precomp2_encode_bytes, precomp2_encode_config,
+  read_bounded,
+};
 
 #[derive(Debug, Clone)]
 pub struct Precomp2Transform {
   gate: TransformGate,
   encode_config: precomp2::EncodeConfig,
   decode_config: precomp2::DecodeConfig,
+  max_mid_bytes: u64,
 }
 
 impl Precomp2Transform {
@@ -20,6 +24,7 @@ impl Precomp2Transform {
       gate: TransformGate::new(config),
       encode_config: precomp2_encode_config(&config.precomp2),
       decode_config: precomp2_decode_config(&config.precomp2),
+      max_mid_bytes: max_mid_stream_bytes(config),
     }
   }
 }
@@ -34,10 +39,7 @@ impl TransformDecoder for Precomp2Transform {
   }
 
   fn decode(&self, input: &mut dyn BufRead, out: &mut dyn Write) -> assetpack_core::Result<()> {
-    let encoded = read_all(input)?;
-    let decoded = precomp2_decode_bytes(&encoded, &self.decode_config)?;
-    out.write_all(&decoded)?;
-    Ok(())
+    precomp2_decode_reader(input, out, &self.decode_config, self.max_mid_bytes)
   }
 }
 
@@ -60,7 +62,7 @@ impl FileTransform for Precomp2Transform {
   }
 
   fn encode(&self, input: &mut dyn BufRead, out: &mut dyn Write) -> assetpack_core::Result<TransformStats> {
-    let input_bytes = read_all(input)?;
+    let input_bytes = read_bounded(input, self.gate.max_size(), "precomp2 encode")?;
     let input_len = input_bytes.len() as u64;
     let encoded = precomp2_encode_bytes(&input_bytes, &self.encode_config)?;
     out.write_all(&encoded)?;
